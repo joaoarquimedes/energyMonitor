@@ -7,9 +7,10 @@
 #include <time.h>
 #include <TZ.h>
 #include <sntp.h>
+#include <math.h>
 
 // Altere somente as credenciais e, se desejar, os limites de retencao.
-const char *SSID = "WIFI";
+const char *SSID = "Cronin 2G";
 const char *SENHA = "SENHA";
 const uint8_t CS_SD = D4;
 const uint8_t BUZZER = D0;
@@ -28,6 +29,154 @@ bool horaAnunciada = false;
 char nomeArquivo[13] = "";
 uint32_t ultimaMedicao = 0;
 uint32_t linhasArquivo = 0;
+
+// Ajustes sonoros escolhidos nos testes (percentual ativo, nao dB).
+const uint16_t FREQUENCIA_INICIO_HZ = 3500;
+const uint8_t VOLUME_INICIO = 12;
+const uint16_t FREQUENCIA_ALARME_HZ = 3000;
+const uint8_t VOLUME_ALARME = 20;
+const uint32_t REPETICAO_ALARME_MS = 15000UL;
+const uint32_t CONFIRMACAO_CONDICAO_MS = 3000UL;
+
+// 0 desativa o respectivo limite. Preencher apos definir os limites da bateria/carga.
+constexpr float TENSAO_BAIXA_V = 0.0f;
+constexpr float TENSAO_CRITICA_V = 0.0f;
+constexpr float CORRENTE_MAXIMA_A = 0.0f;
+const float HISTERESE_TENSAO_V = 0.20f;
+const float HISTERESE_CORRENTE_A = 0.05f;
+
+enum TipoAlarme {
+  SEM_ALARME, BATERIA_BAIXA, BATERIA_CRITICA,
+  ERRO_SD, SOBRECORRENTE, FALHA_INA226
+};
+// Para testar tela e som sem provocar uma falha, escolha um tipo acima.
+// Voltar a SEM_ALARME para funcionamento normal.
+const TipoAlarme ALARME_TESTE = SEM_ALARME;
+TipoAlarme alarmeAtual = SEM_ALARME, candidatoAlarme = SEM_ALARME;
+uint32_t inicioCandidato = 0, ultimoSomAlarme = 0;
+bool somAlarmePendente = false;
+bool cartaoInicializado = false;
+bool logAlertasOK = true;
+bool historicoAlertas = false;
+const char *ARQUIVO_ALERTAS = "/ALERTAS.CSV";
+const char *ARQUIVO_ALERTAS_ANTERIOR = "/ALERTOLD.CSV";
+const uint32_t MAX_BYTES_ALERTAS = 1024UL * 1024UL;
+const uint32_t JANELA_LEITURA_ALERTAS = 8192UL;
+// Prototipo explicito porque o registrador usa obterHorario(), definido adiante.
+bool registrarTransicaoAlarme(TipoAlarme anterior, TipoAlarme novo,
+                              bool leituraOK, float v, float i);
+static_assert(VOLUME_INICIO <= 50 && VOLUME_ALARME <= 50,
+              "Intensidade deve estar entre 0 e 50");
+static_assert(TENSAO_BAIXA_V == 0 || TENSAO_CRITICA_V == 0 ||
+              TENSAO_CRITICA_V < TENSAO_BAIXA_V,
+              "Tensao critica deve ser menor que tensao baixa");
+
+void silenciarBuzzer() { digitalWrite(BUZZER, HIGH); }
+
+// Geracao manual, como no teste que funcionou com este buzzer no D0.
+// Rotinas sonoras sao bloqueantes; durante o som o intervalo de amostragem
+// pode aumentar. O CSV registra o tempo real em tempo_ms.
+void beep(uint16_t frequencia, uint8_t intensidade, uint16_t duracaoMs) {
+  if (intensidade == 0) { delay(duracaoMs); return; }
+  uint32_t periodo = 1000000UL / frequencia;
+  uint32_t ativo = periodo * intensidade / 100;
+  uint32_t inicio = millis(), ultimoYield = inicio;
+  while ((uint32_t)(millis() - inicio) < duracaoMs) {
+    digitalWrite(BUZZER, LOW);
+    delayMicroseconds(ativo);
+    digitalWrite(BUZZER, HIGH);
+    delayMicroseconds(periodo - ativo);
+    if ((uint32_t)(millis() - ultimoYield) >= 10) {
+      yield();
+      ultimoYield = millis();
+    }
+  }
+  silenciarBuzzer();
+}
+
+void beepInicializacao() { beep(FREQUENCIA_INICIO_HZ, VOLUME_INICIO, 80); }
+void beepAlarme(uint16_t duracao) {
+  beep(FREQUENCIA_ALARME_HZ, VOLUME_ALARME, duracao);
+}
+const char *mensagemAlarme(TipoAlarme tipo) {
+  switch (tipo) {
+    case BATERIA_BAIXA: return "BATERIA BAIXA";
+    case BATERIA_CRITICA: return "BATERIA CRITICA";
+    case ERRO_SD: return "FALHA NO CARTAO SD";
+    case SOBRECORRENTE: return "SOBRECORRENTE";
+    case FALHA_INA226: return "FALHA INA226";
+    default: return "";
+  }
+}
+void tocarPadraoAlarme(TipoAlarme tipo) {
+  switch (tipo) {
+    case BATERIA_BAIXA:
+      beepAlarme(150); delay(150); beepAlarme(150); break;
+    case BATERIA_CRITICA:
+      beepAlarme(80); delay(80); beepAlarme(80); delay(80); beepAlarme(80); break;
+    case ERRO_SD:
+      beepAlarme(500); delay(180); beepAlarme(100); break;
+    case SOBRECORRENTE:
+      beepAlarme(700); delay(700); beepAlarme(700); break;
+    case FALHA_INA226:
+      for (uint8_t n = 0; n < 4; ++n) {
+        beepAlarme(80);
+        if (n < 3) delay(80);
+      }
+      break;
+    default: break;
+  }
+}
+
+TipoAlarme detectarAlarme(bool leituraOK, float v, float i) {
+  if (ALARME_TESTE != SEM_ALARME) return ALARME_TESTE;
+  // Prioridade: sensor, sobrecorrente, critica, SD, baixa.
+  if (!leituraOK) return FALHA_INA226;
+  float margemI = alarmeAtual == SOBRECORRENTE ? HISTERESE_CORRENTE_A : 0;
+  if (CORRENTE_MAXIMA_A > 0 && fabsf(i) >= CORRENTE_MAXIMA_A - margemI)
+    return SOBRECORRENTE;
+  float margemCritica = alarmeAtual == BATERIA_CRITICA ? HISTERESE_TENSAO_V : 0;
+  if (TENSAO_CRITICA_V > 0 && v <= TENSAO_CRITICA_V + margemCritica)
+    return BATERIA_CRITICA;
+  if (!sdOK || !logAlertasOK) return ERRO_SD;
+  float margemBaixa = alarmeAtual == BATERIA_BAIXA ? HISTERESE_TENSAO_V : 0;
+  if (TENSAO_BAIXA_V > 0 && v <= TENSAO_BAIXA_V + margemBaixa)
+    return BATERIA_BAIXA;
+  return SEM_ALARME;
+}
+
+void avaliarAlarme(bool leituraOK, float v, float i) {
+  TipoAlarme novo = detectarAlarme(leituraOK, v, i);
+  uint32_t agora = millis();
+  if (novo != candidatoAlarme) {
+    candidatoAlarme = novo;
+    inicioCandidato = agora;
+  }
+  bool imediato = novo == FALHA_INA226 || novo == ERRO_SD ||
+                  ALARME_TESTE != SEM_ALARME;
+  if (novo != alarmeAtual &&
+      (imediato || (uint32_t)(agora - inicioCandidato) >= CONFIRMACAO_CONDICAO_MS)) {
+    TipoAlarme anterior = alarmeAtual;
+    alarmeAtual = novo;
+    if (!registrarTransicaoAlarme(anterior, novo, leituraOK, v, i)) {
+      Serial.println("Falha ao registrar transicao de alarme no SD.");
+    }
+    somAlarmePendente = novo != SEM_ALARME;
+    Serial.print("Alarme: ");
+    Serial.println(novo == SEM_ALARME ? "NORMAL" : mensagemAlarme(novo));
+  }
+}
+
+// Chamar DEPOIS de atualizarTela(): o aviso fica visivel durante o beep.
+void emitirAlarmeSeNecessario() {
+  if (alarmeAtual == SEM_ALARME) return;
+  if (somAlarmePendente ||
+      (uint32_t)(millis() - ultimoSomAlarme) >= REPETICAO_ALARME_MS) {
+    somAlarmePendente = false;
+    tocarPadraoAlarme(alarmeAtual);
+    ultimoSomAlarme = millis();
+  }
+}
 
 bool lerRegistro16(uint8_t registro, uint16_t &valor) {
   Wire.beginTransmission(INA226);
@@ -52,6 +201,156 @@ bool obterHorario(char *data, size_t tamanho, char *curto, size_t tamCurto) {
   strftime(data, tamanho, "%Y-%m-%dT%H:%M:%S%z", &local);
   strftime(curto, tamCurto, "%d/%m %H:%M:%S", &local);
   return true;
+}
+
+// Verifica um registro completo do formato de eventos. Cabecalho, espacos
+// e fragmentos de escrita interrompida nao contam como alerta registrado.
+bool linhaContemAlerta(char *linha) {
+  char *estado = linha;
+  for (uint8_t campo = 0; campo < 3; ++campo) {
+    estado = strchr(estado, ',');
+    if (!estado) return false;
+    ++estado;
+  }
+  if (strncmp(estado, "ALERTA,", 7) != 0) return false;
+  unsigned anterior, novo, leitura;
+  char restante;
+  // Estado, anterior, novo, leitura e tres valores; rejeita fragmentos.
+  float v, i, p;
+  return sscanf(estado + 7, "%u,%u,%u,%f,%f,%f%c",
+                &anterior, &novo, &leitura, &v, &i, &p, &restante) == 6 &&
+         anterior <= FALHA_INA226 && novo > SEM_ALARME &&
+         novo <= FALHA_INA226 && leitura <= 1;
+}
+
+bool arquivoTemAlerta(const char *nome) {
+  if (!SD.exists(nome)) return false;
+  File arquivo = SD.open(nome, FILE_READ);
+  if (!arquivo) { logAlertasOK = false; return false; }
+  uint32_t tamanho = arquivo.size();
+  uint32_t inicio = tamanho > JANELA_LEITURA_ALERTAS ?
+                    tamanho - JANELA_LEITURA_ALERTAS : 0;
+  if (inicio > 0) {
+    if (!arquivo.seek(inicio - 1)) {
+      arquivo.close(); logAlertasOK = false; return false;
+    }
+    // Se caiu no meio de uma linha, ignora somente o fragmento inicial.
+    if (arquivo.read() != '\n') {
+      while (arquivo.available() && arquivo.read() != '\n') yield();
+    }
+  }
+  char linha[192];
+  size_t posicao = 0;
+  bool excedeu = false, encontrou = false;
+  while (arquivo.available()) {
+    int c = arquivo.read();
+    if (c < 0) { logAlertasOK = false; break; }
+    if (c == '\n') {
+      linha[posicao] = '\0';
+      if (!excedeu && linhaContemAlerta(linha)) { encontrou = true; break; }
+      posicao = 0; excedeu = false;
+    } else if (c != '\r') {
+      if (posicao < sizeof(linha) - 1) linha[posicao++] = (char)c;
+      else excedeu = true;
+    }
+    yield();
+  }
+  arquivo.close();
+  return encontrou;
+}
+
+void carregarHistoricoAlertas() {
+  historicoAlertas = false;
+  if (!cartaoInicializado) return;
+  bool atual = arquivoTemAlerta(ARQUIVO_ALERTAS);
+  bool anterior = arquivoTemAlerta(ARQUIVO_ALERTAS_ANTERIOR);
+  historicoAlertas = atual || anterior;
+  Serial.println(historicoAlertas ? "Historico: existem alertas registrados."
+                                 : "Historico: sem alertas registrados.");
+}
+
+// Mantem somente o arquivo atual e a geracao anterior, ate 1 MiB cada.
+// Copia antes de apagar o atual; a API SD usada nao exige rename().
+bool rotacionarAlertas() {
+  File origem = SD.open(ARQUIVO_ALERTAS, FILE_READ);
+  if (!origem) return false;
+  uint32_t tamanho = origem.size(), copiados = 0;
+  if (SD.exists(ARQUIVO_ALERTAS_ANTERIOR) &&
+      !SD.remove(ARQUIVO_ALERTAS_ANTERIOR)) { origem.close(); return false; }
+  File destino = SD.open(ARQUIVO_ALERTAS_ANTERIOR, FILE_WRITE);
+  if (!destino) { origem.close(); return false; }
+  uint8_t bloco[256];
+  bool sucesso = true;
+  while (copiados < tamanho) {
+    size_t pedido = tamanho - copiados;
+    if (pedido > sizeof(bloco)) pedido = sizeof(bloco);
+    int lidos = origem.read(bloco, pedido);
+    if (lidos <= 0 || destino.write(bloco, lidos) != (size_t)lidos) {
+      sucesso = false; break;
+    }
+    copiados += lidos;
+    yield();
+  }
+  destino.close(); origem.close();
+  if (!sucesso || copiados != tamanho) return false;
+  if (!SD.remove(ARQUIVO_ALERTAS)) return false;
+  Serial.println("Rotacao de eventos: ALERTAS.CSV -> ALERTOLD.CSV");
+  return true;
+}
+
+bool registrarTransicaoAlarme(TipoAlarme anterior, TipoAlarme novo,
+                              bool leituraOK, float v, float i) {
+  if (!cartaoInicializado) { logAlertasOK = false; return false; }
+  char data[32], curto[24], linha[192];
+  obterHorario(data, sizeof(data), curto, sizeof(curto));
+  int tamanho = snprintf(linha, sizeof(linha),
+      "%s,%lu,%s,%s,%u,%u,%u,%.3f,%.6f,%.6f\n", data,
+      (unsigned long)millis(), nomeArquivo[0] ? nomeArquivo + 1 : "SEM_CSV",
+      novo == SEM_ALARME ? "NORMAL" : "ALERTA",
+      (unsigned)anterior, (unsigned)novo, leituraOK ? 1U : 0U,
+      leituraOK ? v : 0.0f, leituraOK ? i : 0.0f,
+      leituraOK ? v * i : 0.0f);
+  if (tamanho <= 0 || tamanho >= (int)sizeof(linha)) {
+    logAlertasOK = false; return false;
+  }
+  const char cabecalho[] =
+      "data_hora_local,tempo_ms,arquivo_medicoes,estado,alarme_anterior,"
+      "alarme_atual,leitura_ok,tensao_V,corrente_A,potencia_W\n";
+  uint32_t tamanhoAtual = 0;
+  bool precisaSeparador = false;
+  if (SD.exists(ARQUIVO_ALERTAS)) {
+    File consulta = SD.open(ARQUIVO_ALERTAS, FILE_READ);
+    if (!consulta) { logAlertasOK = false; return false; }
+    tamanhoAtual = consulta.size();
+    if (tamanhoAtual > 0) {
+      if (!consulta.seek(tamanhoAtual - 1)) {
+        consulta.close(); logAlertasOK = false; return false;
+      }
+      precisaSeparador = consulta.read() != '\n';
+    }
+    consulta.close();
+  }
+  if (tamanhoAtual + (uint32_t)tamanho + (precisaSeparador ? 1 : 0) >
+      MAX_BYTES_ALERTAS) {
+    if (!rotacionarAlertas()) { logAlertasOK = false; return false; }
+    tamanhoAtual = 0; precisaSeparador = false;
+  }
+  File arquivo = SD.open(ARQUIVO_ALERTAS, FILE_WRITE);
+  if (!arquivo) { logAlertasOK = false; return false; }
+  bool sucesso = true;
+  if (tamanhoAtual == 0) {
+    sucesso = arquivo.write((const uint8_t *)cabecalho, sizeof(cabecalho) - 1)
+              == sizeof(cabecalho) - 1;
+  } else if (precisaSeparador) {
+    // Se houve escrita interrompida, nao mistura a nova linha com a anterior.
+    sucesso = arquivo.write((uint8_t)'\n') == 1;
+  }
+  if (sucesso) sucesso = arquivo.write((const uint8_t *)linha, tamanho)
+                        == (size_t)tamanho;
+  arquivo.close();
+  logAlertasOK = sucesso;
+  if (sucesso && novo != SEM_ALARME) historicoAlertas = true;
+  return sucesso;
 }
 
 void verificarWiFi() {
@@ -219,6 +518,7 @@ void mostrarLogo() {
   tela.setCursor(34, 50);
   tela.print("DE ENERGIA");
   tela.display();
+  beepInicializacao();
   delay(3000); // ESP8266 continua atendendo Wi-Fi durante delay().
 }
 
@@ -254,14 +554,30 @@ void atualizarTela(bool leituraOK, float v, float i, float p,
     tela.print("--/--");
   }
   tela.setCursor(44, 0);
-  tela.print(sdOK ? "SD:OK" : "SD:ERR");
+  tela.print(sdOK && logAlertasOK ? "SD:OK" : "SD:ERR");
+  if (historicoAlertas) {
+    tela.setCursor(82, 0);
+    tela.print('!');
+  }
   desenharWiFi();
   tela.drawFastHLine(4, 11, 120, SSD1306_WHITE);
   // A faixa azul comeca em y=16. Fonte padrao: 14 pixels visiveis
   // na escala 2, mais 2 pixels de espacamento entre as linhas.
   desenharMedicao('V', v, 16, leituraOK);
   desenharMedicao('A', i, 32, leituraOK);
-  desenharMedicao('W', p, 48, leituraOK);
+  if (alarmeAtual == SEM_ALARME) {
+    desenharMedicao('W', p, 48, leituraOK);
+  } else {
+    // Mantem V e A grandes. O alerta ocupa a linha inferior de potencia.
+    tela.fillRect(4, 48, 120, 8, SSD1306_WHITE);
+    tela.setTextSize(1);
+    tela.setTextColor(SSD1306_BLACK);
+    tela.setCursor(46, 48);
+    tela.print("ALERTA");
+    tela.setTextColor(SSD1306_WHITE);
+    tela.setCursor(4, 56);
+    tela.print(mensagemAlarme(alarmeAtual));
+  }
   tela.display();
 }
 
@@ -277,7 +593,9 @@ void setup() {
   pinMode(CS_SD, OUTPUT);
   digitalWrite(CS_SD, HIGH);
   SPI.begin();
-  sdOK = SD.begin(CS_SD);
+  cartaoInicializado = SD.begin(CS_SD);
+  sdOK = cartaoInicializado;
+  carregarHistoricoAlertas();
   if (sdOK) sdOK = criarArquivo();
   if (!sdOK) Serial.println("Falha SD: gravacao desativada.");
   WiFi.persistent(false);
@@ -285,7 +603,8 @@ void setup() {
   WiFi.setAutoReconnect(true);
   WiFi.begin(SSID, SENHA);
   Serial.println("Aguardando Wi-Fi e horario NTP...");
-  mostrarLogo();
+  if (oledOK) mostrarLogo();
+  else beepInicializacao();
   atualizarTela(false, 0, 0, 0, "NTP aguardando");
   ultimaMedicao = millis();
 }
@@ -308,7 +627,9 @@ void loop() {
   if (!lerRegistro16(0x02, brutoBarramento) ||
       !lerRegistro16(0x01, brutoShunt)) {
     Serial.println("Falha ao ler INA226.");
+    avaliarAlarme(false, 0, 0);
     atualizarTela(false, 0, 0, 0, horario);
+    emitirAlarmeSeNecessario();
     return;
   }
   float volts = brutoBarramento * 0.00125f;
@@ -324,8 +645,10 @@ void loop() {
   Serial.print(" | Tensao: "); Serial.print(volts, 3); Serial.print(" V");
   Serial.print(" | Corrente: "); Serial.print(corrente, 3); Serial.print(" A");
   Serial.print(" | Potencia: "); Serial.print(potencia, 3); Serial.print(" W");
-  Serial.print(sdOK ? " | SD: OK" : " | SD: ERRO");
+  Serial.print(sdOK && logAlertasOK ? " | SD: OK" : " | SD: ERRO");
   Serial.println(WiFi.status() == WL_CONNECTED ? " | WiFi: OK"
                                               : " | WiFi: DESCONECTADO");
+  avaliarAlarme(true, volts, corrente);
   atualizarTela(true, volts, corrente, potencia, horario);
+  emitirAlarmeSeNecessario();
 }
