@@ -1,3 +1,7 @@
+#include <Arduino.h>
+#include <LittleFS.h>
+#include <stddef.h>
+#include <string.h>
 #include <Wire.h>
 #include <SPI.h>
 #include <SD.h>
@@ -9,8 +13,16 @@
 #include <sntp.h>
 #include <math.h>
 
-// Altere somente as credenciais e, se desejar, os limites de retencao.
-const char *SSID = "Cronin 2G";
+// NodeMCU ESP8266: OLED 0x3C, INA226 0x40, MCP23017 0x20.
+// I2C SDA D2 / SCL D1; microSD CS D4 / SCK D5 / MISO D6 / MOSI D7.
+// Botoes GPA0 anterior / GPA1 confirmar / GPA2 proximo, para GND.
+// LEDs GPB0 vermelho / GPB1 amarelo / GPB2 verde / GPB3 azul, resistor 1k cada.
+// Buzzer modulo HIGH em D0: LOW desliga. Alimentacao conforme modulo.
+// Configure Flash Size com FS > 0; preserve a mesma particao do teste.
+// Configuracoes na LittleFS; CSVs e eventos no SD. Nunca formata automaticamente.
+// Limites de alarme sao avisos: este codigo NAO corta a alimentacao da carga.
+// Altere as credenciais abaixo. Limites podem ser ajustados no menu.
+const char *SSID = "WIFI NAME";
 const char *SENHA = "SENHA";
 const uint8_t CS_SD = D4;
 const uint8_t BUZZER = D0;
@@ -30,25 +42,280 @@ char nomeArquivo[13] = "";
 uint32_t ultimaMedicao = 0;
 uint32_t linhasArquivo = 0;
 
-// Ajustes sonoros escolhidos nos testes (percentual ativo, nao dB).
-const uint16_t FREQUENCIA_INICIO_HZ = 3500;
-const uint8_t VOLUME_INICIO = 12;
-const uint16_t FREQUENCIA_ALARME_HZ = 3000;
-const uint8_t VOLUME_ALARME = 20;
+// Configuracoes persistentes do monitor (independentes do teste anterior).
+struct ConfigMonitor {
+  uint32_t magic, versao, geracao;
+  uint16_t baixaCV, criticaCV, altaCV, maximaCA;
+  uint16_t som, duracaoMs, frequenciaHz, volume;
+  uint32_t checksum;
+};
+uint32_t checksumConfig(const ConfigMonitor &c);
+bool validarConfig(const ConfigMonitor &c);
+bool mesmosValores(const ConfigMonitor &a, const ConfigMonitor &b);
+ConfigMonitor padroesConfig();
+bool lerConfig(int slot, ConfigMonitor &c);
+bool haAlarmeAtivo();
+const char *textoAlarmeAtivo();
+enum PaginaMenu { TELA_PRINCIPAL, LISTA_MENU, EDITAR_MENU, RESTAURAR_MENU };
+ConfigMonitor configuracao = {}, edicao = {};
+PaginaMenu pagina = TELA_PRINCIPAL;
+bool fsOK = false, mcpOK = false, configSalva = false, falhaMCP = false;
+int slotConfig = -1, itemMenu = 0;
+bool telaPendente = true;
+bool leituraAtualOK = false;
+float tensaoAtual = 0, correnteAtual = 0, potenciaAtual = 0;
+char horarioAtual[24] = "NTP aguardando";
+const char *avisoMenu = "";
+uint32_t avisoMenuEm = 0, mudouBotaoEm[3], ultimaFalhaMCP = 0;
+bool botaoLido[3], botaoEstavel[3];
+const char *CONFIG_FILES[2] = {"/monitor_a.bin", "/monitor_b.bin"};
+// No modo ativo, a frequencia do som e determinada pelo proprio buzzer.
+// Se HIGH constante produzir somente um clique, use BUZZER_PASSIVO=true.
+const bool BUZZER_PASSIVO = false;
+const uint8_t NIVEL_BUZZER_LIGADO = HIGH;
+const uint8_t NIVEL_BUZZER_DESLIGADO = LOW;
+const char *ITENS_MENU[] = {
+  "Tensao baixa", "Tensao critica", "Tensao alta", "Corrente maxima",
+  "Som dos alarmes", "Duracao do beep",
+  "Frequencia", "Intensidade", "Salvar e sair", "Cancelar", "Restaurar padroes"
+};
+// Os indices 6 e 7 sao pulados se BUZZER_PASSIVO=false.
+const int TOTAL_ITENS = 11;
+uint16_t temposSom[9];
+uint8_t totalTemposSom = 0, passoSom = 0;
+uint32_t passoSomEm = 0;
+bool tocandoSom = false;
+
+uint32_t checksumConfig(const ConfigMonitor &c) {
+  const uint8_t *p = reinterpret_cast<const uint8_t *>(&c);
+  uint32_t h = 2166136261UL;
+  for (size_t n = 0; n < offsetof(ConfigMonitor, checksum); n++) h = (h ^ p[n]) * 16777619UL;
+  return h;
+}
+bool validarConfig(const ConfigMonitor &c) {
+  if (c.baixaCV > 1800 || c.criticaCV > 1800 || c.altaCV > 3600 ||
+      c.maximaCA > 2000 || c.som > 1 || c.duracaoMs < 50 || c.duracaoMs > 500 ||
+      c.frequenciaHz < 500 || c.frequenciaHz > 4000 || c.volume > 50) return false;
+  if (c.baixaCV && c.criticaCV && c.criticaCV >= c.baixaCV) return false;
+  if (c.altaCV && ((c.baixaCV && c.altaCV <= c.baixaCV) ||
+                  (c.criticaCV && c.altaCV <= c.criticaCV))) return false;
+  return true;
+}
+bool mesmosValores(const ConfigMonitor &a, const ConfigMonitor &b) {
+  return a.baixaCV == b.baixaCV && a.criticaCV == b.criticaCV &&
+    a.altaCV == b.altaCV && a.maximaCA == b.maximaCA && a.som == b.som &&
+    a.duracaoMs == b.duracaoMs && a.frequenciaHz == b.frequenciaHz && a.volume == b.volume;
+}
+ConfigMonitor padroesConfig() {
+  ConfigMonitor c = {};
+  // Limites 0 = desativados, preservando o comportamento do codigo recebido.
+  c.som = 1; c.duracaoMs = 150; c.frequenciaHz = 3000; c.volume = 20;
+  return c;
+}
+bool lerConfig(int slot, ConfigMonitor &c) {
+  File f = LittleFS.open(CONFIG_FILES[slot], "r");
+  if (!f) return false;
+  bool ok = f.size() == sizeof(c) && f.read(reinterpret_cast<uint8_t *>(&c), sizeof(c)) == sizeof(c);
+  f.close();
+  return ok && c.magic == 0x4D4F4E49UL && c.versao == 1 &&
+    validarConfig(c) && c.checksum == checksumConfig(c);
+}
+void carregarConfiguracao() {
+  LittleFSConfig cfg; cfg.setAutoFormat(false); LittleFS.setConfig(cfg);
+  fsOK = LittleFS.begin(); configuracao = padroesConfig(); slotConfig = -1;
+  ConfigMonitor a = {}, b = {};
+  bool va = fsOK && lerConfig(0, a), vb = fsOK && lerConfig(1, b);
+  if (va && (!vb || static_cast<int32_t>(a.geracao - b.geracao) > 0)) {
+    configuracao = a; slotConfig = 0;
+  } else if (vb) { configuracao = b; slotConfig = 1; }
+  configSalva = slotConfig >= 0; edicao = configuracao;
+  Serial.println(!fsOK ? "LittleFS: erro de montagem; usando padroes, salvar indisponivel."
+    : configSalva ? "LittleFS: configuracao recuperada." : "LittleFS: padroes; nenhum ajuste do monitor salvo.");
+}
+bool salvarConfiguracao() {
+  if (!fsOK || !validarConfig(edicao)) return false;
+  if (configSalva && mesmosValores(edicao, configuracao)) return true;
+  ConfigMonitor nova = edicao;
+  nova.magic = 0x4D4F4E49UL; nova.versao = 1; nova.geracao = configuracao.geracao + 1;
+  nova.checksum = checksumConfig(nova);
+  int destino = slotConfig == 0 ? 1 : 0;
+  File f = LittleFS.open(CONFIG_FILES[destino], "w");
+  if (!f) return false;
+  size_t escritos = f.write(reinterpret_cast<const uint8_t *>(&nova), sizeof(nova));
+  f.flush(); f.close();
+  ConfigMonitor conferida = {};
+  if (escritos != sizeof(nova) || !lerConfig(destino, conferida) ||
+      memcmp(&nova, &conferida, sizeof(nova)) != 0) return false;
+  configuracao = conferida; edicao = configuracao; slotConfig = destino; configSalva = true;
+  Serial.printf("Ajustes salvos: baixa=%.2f critica=%.2f alta=%.2f maxima=%.2f som=%u beep=%u ms\n",
+    configuracao.baixaCV / 100.0, configuracao.criticaCV / 100.0,
+    configuracao.altaCV / 100.0, configuracao.maximaCA / 100.0,
+    configuracao.som, configuracao.duracaoMs);
+  return true;
+}
+bool escreverMCP(uint8_t reg, uint8_t valor) {
+  Wire.beginTransmission(0x20); Wire.write(reg); Wire.write(valor);
+  return Wire.endTransmission() == 0;
+}
+bool lerMCP(uint8_t &valor) {
+  Wire.beginTransmission(0x20); Wire.write(0x12);
+  if (Wire.endTransmission(false) != 0) return false;
+  if (Wire.requestFrom((uint8_t)0x20, (uint8_t)1) != 1) return false;
+  valor = Wire.read(); return true;
+}
+void iniciarMCP() {
+  // BANK=0, padrao apos energizar. A0-A2 de endereco em GND, RESET em 3V3.
+  bool ok = escreverMCP(0x0A, 0);
+  ok = escreverMCP(0x00, 0xFF) && ok;
+  ok = escreverMCP(0x02, 0) && ok;
+  ok = escreverMCP(0x0C, 0x07) && ok;
+  ok = escreverMCP(0x15, 0) && ok;
+  ok = escreverMCP(0x01, 0xF0) && ok;
+  uint8_t valor = 0xFF; mcpOK = lerMCP(valor) && ok;
+  for (uint8_t n = 0; n < 3; n++) {
+    botaoLido[n] = botaoEstavel[n] = (valor & (1 << n)) != 0;
+    mudouBotaoEm[n] = millis();
+  }
+  Serial.println(mcpOK ? "MCP23017: OK." : "MCP23017: falha, monitor continua sem menu.");
+}
+void avisarMenu(const char *texto) {
+  avisoMenu = texto; avisoMenuEm = millis(); telaPendente = true; Serial.println(texto);
+}
+int proximoItem(int item, int sentido) {
+  do { item = (item + sentido + TOTAL_ITENS) % TOTAL_ITENS; }
+  while (!BUZZER_PASSIVO && (item == 6 || item == 7));
+  return item;
+}
+String valorMenu() {
+  uint16_t valor = itemMenu == 0 ? edicao.baixaCV : itemMenu == 1 ? edicao.criticaCV :
+    itemMenu == 2 ? edicao.altaCV : edicao.maximaCA;
+  if (itemMenu <= 3) {
+    if (!valor) return "DESATIVADO";
+    return String(valor / 100.0, 2) + (itemMenu == 3 ? " A" : " V");
+  }
+  if (itemMenu == 4) return edicao.som ? "LIGADO" : "DESLIGADO";
+  if (itemMenu == 5) return String(edicao.duracaoMs) + " ms";
+  if (itemMenu == 6) return String(edicao.frequenciaHz) + " Hz";
+  return String(edicao.volume) + "%";
+}
+void ajustarItem(int sentido) {
+  int valor = 0, limite = 0;
+  if (itemMenu <= 3) {
+    uint16_t *alvo = itemMenu == 0 ? &edicao.baixaCV : itemMenu == 1 ? &edicao.criticaCV :
+      itemMenu == 2 ? &edicao.altaCV : &edicao.maximaCA;
+    limite = itemMenu == 2 ? 3600 : itemMenu == 3 ? 2000 : 1800;
+    valor = *alvo;
+    if (valor == 0 && sentido > 0) valor = itemMenu == 3 ? 100 : itemMenu == 2 ? 1500 : itemMenu == 1 ? 1050 : 1150;
+    else if (sentido < 0 && valor <= (itemMenu == 3 ? 10 : 800)) valor = 0;
+    else valor = constrain(valor + sentido * 10, 0, limite);
+    *alvo = valor;
+  } else if (itemMenu == 4) edicao.som = !edicao.som;
+  else if (itemMenu == 5) edicao.duracaoMs = constrain((int)edicao.duracaoMs + sentido * 25, 50, 500);
+  else if (itemMenu == 6) edicao.frequenciaHz = constrain((int)edicao.frequenciaHz + sentido * 100, 500, 4000);
+  else edicao.volume = constrain((int)edicao.volume + sentido, 0, 50);
+}
+void botaoPressionado(uint8_t n) {
+  telaPendente = true;
+  if (pagina == TELA_PRINCIPAL) {
+    if (n == 1) { edicao = configuracao; itemMenu = 0; pagina = LISTA_MENU; }
+  } else if (pagina == LISTA_MENU) {
+    if (n != 1) itemMenu = proximoItem(itemMenu, n == 0 ? -1 : 1);
+    else if (itemMenu < 8) pagina = EDITAR_MENU;
+    else if (itemMenu == 8) {
+      if (!validarConfig(edicao)) avisarMenu("Limites inconsistentes");
+      else if (!salvarConfiguracao()) avisarMenu("Falha salvar LittleFS");
+      else { pagina = TELA_PRINCIPAL; avisarMenu("Configuracao salva"); }
+    } else if (itemMenu == 9) { edicao = configuracao; pagina = TELA_PRINCIPAL; avisarMenu("Edicao cancelada"); }
+    else pagina = RESTAURAR_MENU;
+  } else if (pagina == EDITAR_MENU) {
+    if (n == 1) pagina = LISTA_MENU; else ajustarItem(n == 0 ? -1 : 1);
+  } else {
+    if (n == 1) { edicao = padroesConfig(); avisarMenu("Padroes: falta salvar"); }
+    pagina = LISTA_MENU;
+  }
+}
+void verificarBotoes() {
+  if (!mcpOK) return;
+  static int limiteSegurado = -1;
+  static bool desativouNestaPressao = false;
+  uint8_t entradas; uint32_t agora = millis();
+  if (!lerMCP(entradas)) {
+    if (!falhaMCP) { falhaMCP = true; telaPendente = true; Serial.println("Falha I2C MCP23017."); }
+    // Requer nova leitura estavel depois de uma interrupcao.
+    for (uint8_t n = 0; n < 3; n++) mudouBotaoEm[n] = agora;
+    return;
+  }
+  if (falhaMCP) { falhaMCP = false; telaPendente = true; }
+  for (uint8_t n = 0; n < 3; n++) {
+    bool nivel = (entradas & (1 << n)) != 0;
+    if (nivel != botaoLido[n]) { botaoLido[n] = nivel; mudouBotaoEm[n] = agora; }
+    if (nivel != botaoEstavel[n] && agora - mudouBotaoEm[n] >= 35) {
+      botaoEstavel[n] = nivel;
+      if (n == 0) {
+        limiteSegurado = !nivel && pagina == EDITAR_MENU && itemMenu <= 3 ? itemMenu : -1;
+        desativouNestaPressao = false;
+      }
+      if (!nivel) botaoPressionado(n);
+    }
+  }
+  // Pressao longa no Anterior desativa somente o limite em edicao.
+  // A mudanca continua pendente: Salvar aplica; Cancelar descarta.
+  if (!botaoEstavel[0] && !botaoLido[0] && !desativouNestaPressao &&
+      pagina == EDITAR_MENU && limiteSegurado == itemMenu && itemMenu <= 3 &&
+      agora - mudouBotaoEm[0] >= 1200) {
+    uint16_t *alvo = itemMenu == 0 ? &edicao.baixaCV : itemMenu == 1 ? &edicao.criticaCV :
+      itemMenu == 2 ? &edicao.altaCV : &edicao.maximaCA;
+    *alvo = 0;
+    desativouNestaPressao = true;
+    avisarMenu("Limite desativado");
+  }
+  if (avisoMenu[0] && agora - avisoMenuEm >= 2500) { avisoMenu = ""; telaPendente = true; }
+}
+void desenharMenu() {
+  if (!oledOK) return;
+  tela.clearDisplay(); tela.setTextColor(SSD1306_WHITE); tela.setTextSize(1);
+  tela.setCursor(0, 0); tela.print("CONFIG");
+  if (haAlarmeAtivo()) { tela.setCursor(51, 0); tela.print('!'); }
+  tela.setCursor(67, 0); tela.print(fsOK ? "FS:OK" : "FS:ERR");
+  if (!mesmosValores(configuracao, edicao)) { tela.setCursor(121, 0); tela.print('*'); }
+  tela.drawFastHLine(0, 11, 128, SSD1306_WHITE);
+  tela.setCursor(0, 16);
+  if (pagina == LISTA_MENU) {
+    // Janela de 4 itens, sempre incluindo o selecionado.
+    int indice = itemMenu;
+    for (uint8_t n = 0; n < 4; n++) {
+      tela.print(n == 0 ? ">" : " "); tela.println(ITENS_MENU[indice]);
+      indice = proximoItem(indice, 1);
+    }
+  } else if (pagina == EDITAR_MENU) {
+    tela.println(ITENS_MENU[itemMenu]);
+    String valor = valorMenu(); tela.setTextSize(valor.length() > 10 ? 1 : 2);
+    tela.setCursor(0, 29); tela.print(valor); tela.setTextSize(1);
+    tela.setCursor(0, 47); tela.print("Anterior - Proximo +");
+  } else {
+    tela.println("Restaurar padroes?"); tela.println("Confirmar: sim");
+    tela.println("Anterior/Proximo: nao"); tela.println("Depois escolha Salvar");
+  }
+  tela.setCursor(0, 56);
+  if (avisoMenu[0]) tela.print(avisoMenu);
+  else if (haAlarmeAtivo()) tela.print(textoAlarmeAtivo());
+  else if (pagina == EDITAR_MENU && itemMenu <= 3) tela.print("Segure Anterior: OFF");
+  else tela.print("Confirmar: selecionar");
+  tela.display();
+}
+
 const uint32_t REPETICAO_ALARME_MS = 15000UL;
 const uint32_t CONFIRMACAO_CONDICAO_MS = 3000UL;
-
-// 0 desativa o respectivo limite. Preencher apos definir os limites da bateria/carga.
-constexpr float TENSAO_BAIXA_V = 0.0f;
-constexpr float TENSAO_CRITICA_V = 0.0f;
-constexpr float CORRENTE_MAXIMA_A = 0.0f;
 const float HISTERESE_TENSAO_V = 0.20f;
 const float HISTERESE_CORRENTE_A = 0.05f;
 
 enum TipoAlarme {
   SEM_ALARME, BATERIA_BAIXA, BATERIA_CRITICA,
-  ERRO_SD, SOBRECORRENTE, FALHA_INA226
+  ERRO_SD, SOBRECORRENTE, FALHA_INA226, TENSAO_ALTA
 };
+const char *mensagemAlarme(TipoAlarme tipo);
+void tocarPadraoAlarme(TipoAlarme tipo);
+TipoAlarme detectarAlarme(bool leituraOK, float v, float i);
 // Para testar tela e som sem provocar uma falha, escolha um tipo acima.
 // Voltar a SEM_ALARME para funcionamento normal.
 const TipoAlarme ALARME_TESTE = SEM_ALARME;
@@ -65,38 +332,43 @@ const uint32_t JANELA_LEITURA_ALERTAS = 8192UL;
 // Prototipo explicito porque o registrador usa obterHorario(), definido adiante.
 bool registrarTransicaoAlarme(TipoAlarme anterior, TipoAlarme novo,
                               bool leituraOK, float v, float i);
-static_assert(VOLUME_INICIO <= 50 && VOLUME_ALARME <= 50,
-              "Intensidade deve estar entre 0 e 50");
-static_assert(TENSAO_BAIXA_V == 0 || TENSAO_CRITICA_V == 0 ||
-              TENSAO_CRITICA_V < TENSAO_BAIXA_V,
-              "Tensao critica deve ser menor que tensao baixa");
-
-void silenciarBuzzer() { digitalWrite(BUZZER, HIGH); }
-
-// Geracao manual, como no teste que funcionou com este buzzer no D0.
-// Rotinas sonoras sao bloqueantes; durante o som o intervalo de amostragem
-// pode aumentar. O CSV registra o tempo real em tempo_ms.
-void beep(uint16_t frequencia, uint8_t intensidade, uint16_t duracaoMs) {
-  if (intensidade == 0) { delay(duracaoMs); return; }
-  uint32_t periodo = 1000000UL / frequencia;
-  uint32_t ativo = periodo * intensidade / 100;
-  uint32_t inicio = millis(), ultimoYield = inicio;
-  while ((uint32_t)(millis() - inicio) < duracaoMs) {
-    digitalWrite(BUZZER, LOW);
-    delayMicroseconds(ativo);
-    digitalWrite(BUZZER, HIGH);
-    delayMicroseconds(periodo - ativo);
-    if ((uint32_t)(millis() - ultimoYield) >= 10) {
-      yield();
-      ultimoYield = millis();
-    }
-  }
-  silenciarBuzzer();
+// Sequencia de duracoes ON/OFF atendida pelo loop, sem delay de alarme.
+void silenciarBuzzer() {
+  if (BUZZER_PASSIVO) analogWrite(BUZZER, 0);
+  digitalWrite(BUZZER, NIVEL_BUZZER_DESLIGADO);
 }
-
-void beepInicializacao() { beep(FREQUENCIA_INICIO_HZ, VOLUME_INICIO, 80); }
-void beepAlarme(uint16_t duracao) {
-  beep(FREQUENCIA_ALARME_HZ, VOLUME_ALARME, duracao);
+void acionarBuzzer(bool ligado, bool inicializacao = false) {
+  if (!ligado) { silenciarBuzzer(); return; }
+  if (BUZZER_PASSIVO) {
+    uint16_t hz = inicializacao ? 3500 : configuracao.frequenciaHz;
+    uint8_t intensidade = inicializacao ? 12 : configuracao.volume;
+    analogWriteRange(1000); analogWriteFreq(hz);
+    // PWM do modulo HIGH. Intensidade e duty cycle, nao volume em dB.
+    analogWrite(BUZZER, intensidade * 10);
+  } else digitalWrite(BUZZER, NIVEL_BUZZER_LIGADO);
+}
+void pararSom() {
+  if (tocandoSom) telaPendente = true;
+  tocandoSom = false; totalTemposSom = 0; silenciarBuzzer();
+}
+void iniciarSom(const uint16_t *tempos, uint8_t quantidade) {
+  pararSom();
+  if (!configuracao.som || quantidade == 0 || quantidade > 9) return;
+  memcpy(temposSom, tempos, quantidade * sizeof(uint16_t));
+  totalTemposSom = quantidade; passoSom = 0;
+  passoSomEm = millis(); tocandoSom = true; telaPendente = true; acionarBuzzer(true);
+}
+void atualizarSom() {
+  if (!tocandoSom) return;
+  if (!configuracao.som || alarmeAtual == SEM_ALARME) { pararSom(); return; }
+  if ((uint32_t)(millis() - passoSomEm) < temposSom[passoSom]) return;
+  ++passoSom;
+  if (passoSom >= totalTemposSom) { pararSom(); return; }
+  passoSomEm = millis(); acionarBuzzer((passoSom % 2) == 0);
+}
+void beepInicializacao() {
+  if (!configuracao.som) return;
+  acionarBuzzer(true, true); delay(80); silenciarBuzzer();
 }
 const char *mensagemAlarme(TipoAlarme tipo) {
   switch (tipo) {
@@ -105,42 +377,48 @@ const char *mensagemAlarme(TipoAlarme tipo) {
     case ERRO_SD: return "FALHA NO CARTAO SD";
     case SOBRECORRENTE: return "SOBRECORRENTE";
     case FALHA_INA226: return "FALHA INA226";
+    case TENSAO_ALTA: return "TENSAO ALTA";
     default: return "";
   }
 }
+bool haAlarmeAtivo() { return alarmeAtual != SEM_ALARME; }
+const char *textoAlarmeAtivo() { return mensagemAlarme(alarmeAtual); }
 void tocarPadraoAlarme(TipoAlarme tipo) {
+  uint16_t b = configuracao.duracaoMs;
+  // Alarmes identificados pela quantidade e duracao, independentemente do tom.
+  const uint16_t baixa[] = {b, b, b};                        // 2 curtos
+  const uint16_t critica[] = {b, b, b, b, b};               // 3 curtos
+  const uint16_t sd[] = {(uint16_t)(3*b), b, b};            // longo + curto
+  const uint16_t corrente[] = {(uint16_t)(4*b), (uint16_t)(4*b), (uint16_t)(4*b)};
+  const uint16_t sensor[] = {b,b,b,b,b,b,b};                 // 4 curtos
+  const uint16_t alta[] = {b,b,(uint16_t)(3*b)};             // curto + longo
   switch (tipo) {
-    case BATERIA_BAIXA:
-      beepAlarme(150); delay(150); beepAlarme(150); break;
-    case BATERIA_CRITICA:
-      beepAlarme(80); delay(80); beepAlarme(80); delay(80); beepAlarme(80); break;
-    case ERRO_SD:
-      beepAlarme(500); delay(180); beepAlarme(100); break;
-    case SOBRECORRENTE:
-      beepAlarme(700); delay(700); beepAlarme(700); break;
-    case FALHA_INA226:
-      for (uint8_t n = 0; n < 4; ++n) {
-        beepAlarme(80);
-        if (n < 3) delay(80);
-      }
-      break;
-    default: break;
+    case BATERIA_BAIXA: iniciarSom(baixa, 3); break;
+    case BATERIA_CRITICA: iniciarSom(critica, 5); break;
+    case ERRO_SD: iniciarSom(sd, 3); break;
+    case SOBRECORRENTE: iniciarSom(corrente, 3); break;
+    case FALHA_INA226: iniciarSom(sensor, 7); break;
+    case TENSAO_ALTA: iniciarSom(alta, 3); break;
+    default: pararSom(); break;
   }
 }
 
 TipoAlarme detectarAlarme(bool leituraOK, float v, float i) {
   if (ALARME_TESTE != SEM_ALARME) return ALARME_TESTE;
-  // Prioridade: sensor, sobrecorrente, critica, SD, baixa.
+  // Prioridade: sensor, sobrecorrente, critica, tensao alta, SD, baixa.
   if (!leituraOK) return FALHA_INA226;
   float margemI = alarmeAtual == SOBRECORRENTE ? HISTERESE_CORRENTE_A : 0;
-  if (CORRENTE_MAXIMA_A > 0 && fabsf(i) >= CORRENTE_MAXIMA_A - margemI)
+  if ((configuracao.maximaCA / 100.0f) > 0 && fabsf(i) >= (configuracao.maximaCA / 100.0f) - margemI)
     return SOBRECORRENTE;
   float margemCritica = alarmeAtual == BATERIA_CRITICA ? HISTERESE_TENSAO_V : 0;
-  if (TENSAO_CRITICA_V > 0 && v <= TENSAO_CRITICA_V + margemCritica)
+  if ((configuracao.criticaCV / 100.0f) > 0 && v <= (configuracao.criticaCV / 100.0f) + margemCritica)
     return BATERIA_CRITICA;
+  float margemAlta = alarmeAtual == TENSAO_ALTA ? HISTERESE_TENSAO_V : 0;
+  if (configuracao.altaCV > 0 && v >= configuracao.altaCV / 100.0f - margemAlta)
+    return TENSAO_ALTA;
   if (!sdOK || !logAlertasOK) return ERRO_SD;
   float margemBaixa = alarmeAtual == BATERIA_BAIXA ? HISTERESE_TENSAO_V : 0;
-  if (TENSAO_BAIXA_V > 0 && v <= TENSAO_BAIXA_V + margemBaixa)
+  if ((configuracao.baixaCV / 100.0f) > 0 && v <= (configuracao.baixaCV / 100.0f) + margemBaixa)
     return BATERIA_BAIXA;
   return SEM_ALARME;
 }
@@ -158,6 +436,8 @@ void avaliarAlarme(bool leituraOK, float v, float i) {
       (imediato || (uint32_t)(agora - inicioCandidato) >= CONFIRMACAO_CONDICAO_MS)) {
     TipoAlarme anterior = alarmeAtual;
     alarmeAtual = novo;
+    pararSom();
+    telaPendente = true;
     if (!registrarTransicaoAlarme(anterior, novo, leituraOK, v, i)) {
       Serial.println("Falha ao registrar transicao de alarme no SD.");
     }
@@ -169,7 +449,7 @@ void avaliarAlarme(bool leituraOK, float v, float i) {
 
 // Chamar DEPOIS de atualizarTela(): o aviso fica visivel durante o beep.
 void emitirAlarmeSeNecessario() {
-  if (alarmeAtual == SEM_ALARME) return;
+  if (alarmeAtual == SEM_ALARME || !configuracao.som || tocandoSom) return;
   if (somAlarmePendente ||
       (uint32_t)(millis() - ultimoSomAlarme) >= REPETICAO_ALARME_MS) {
     somAlarmePendente = false;
@@ -219,8 +499,8 @@ bool linhaContemAlerta(char *linha) {
   float v, i, p;
   return sscanf(estado + 7, "%u,%u,%u,%f,%f,%f%c",
                 &anterior, &novo, &leitura, &v, &i, &p, &restante) == 6 &&
-         anterior <= FALHA_INA226 && novo > SEM_ALARME &&
-         novo <= FALHA_INA226 && leitura <= 1;
+         anterior <= TENSAO_ALTA && novo > SEM_ALARME &&
+         novo <= TENSAO_ALTA && leitura <= 1;
 }
 
 bool arquivoTemAlerta(const char *nome) {
@@ -582,14 +862,17 @@ void atualizarTela(bool leituraOK, float v, float i, float p,
 }
 
 void setup() {
-  digitalWrite(BUZZER, HIGH);
+  digitalWrite(BUZZER, NIVEL_BUZZER_DESLIGADO);
   pinMode(BUZZER, OUTPUT);
   Serial.begin(115200);
   delay(500);
   Wire.begin(D2, D1);
+  carregarConfiguracao();
   Wire.setClock(100000);
   oledOK = tela.begin(SSD1306_SWITCHCAPVCC, 0x3C);
   if (!oledOK) Serial.println("Falha ao inicializar OLED.");
+  Wire.setClock(100000);
+  iniciarMCP();
   pinMode(CS_SD, OUTPUT);
   digitalWrite(CS_SD, HIGH);
   SPI.begin();
@@ -601,7 +884,7 @@ void setup() {
   WiFi.persistent(false);
   WiFi.mode(WIFI_STA);
   WiFi.setAutoReconnect(true);
-  WiFi.begin(SSID, SENHA);
+  if (SSID[0]) WiFi.begin(SSID, SENHA);
   Serial.println("Aguardando Wi-Fi e horario NTP...");
   if (oledOK) mostrarLogo();
   else beepInicializacao();
@@ -609,46 +892,62 @@ void setup() {
   ultimaMedicao = millis();
 }
 
+// Vermelho: alarme/falha local; amarelo: historico ou edicao pendente;
+// verde: leitura valida sem alarme; azul: Wi-Fi conectado.
+void atualizarLEDs() {
+  if (!mcpOK || falhaMCP) return;
+  uint8_t leds = 0;
+  if (alarmeAtual != SEM_ALARME || !fsOK) leds |= 0x01;
+  if (historicoAlertas || !mesmosValores(configuracao, edicao)) leds |= 0x02;
+  if (leituraAtualOK && alarmeAtual == SEM_ALARME) leds |= 0x04;
+  if (WiFi.status() == WL_CONNECTED) leds |= 0x08;
+  static uint8_t anterior = 0xFF;
+  if (leds != anterior && escreverMCP(0x15, leds)) anterior = leds;
+}
+void apresentarTela() {
+  // O alerta nao retira o usuario do menu. No menu aparece ! e o texto
+  // no rodape; som, medicoes e registros continuam ativos.
+  if (pagina == TELA_PRINCIPAL)
+    atualizarTela(leituraAtualOK, tensaoAtual, correnteAtual, potenciaAtual, horarioAtual);
+  else desenharMenu();
+  telaPendente = false;
+}
 void loop() {
-  verificarWiFi();
+  verificarWiFi(); verificarBotoes(); atualizarSom();
   uint32_t agora = millis();
-  if ((uint32_t)(agora - ultimaMedicao) < INTERVALO_MS) {
-    delay(1);
-    return;
+  static uint32_t ultimaTela = 0;
+  if ((uint32_t)(agora - ultimaMedicao) >= INTERVALO_MS) {
+    ultimaMedicao = agora;
+    char data[32];
+    bool horaOK = obterHorario(data, sizeof(data), horarioAtual, sizeof(horarioAtual));
+    if (horaOK && !horaAnunciada) {
+      horaAnunciada = true; Serial.print("Hora sincronizada: "); Serial.println(data);
+    }
+    uint16_t brutoBarramento, brutoShunt;
+    leituraAtualOK = lerRegistro16(0x02, brutoBarramento) && lerRegistro16(0x01, brutoShunt);
+    if (!leituraAtualOK) {
+      tensaoAtual = correnteAtual = potenciaAtual = 0;
+      Serial.println("Falha ao ler INA226.");
+    } else {
+      tensaoAtual = brutoBarramento * 0.00125f;
+      float voltsShunt = (int16_t)brutoShunt * 0.0000025f;
+      correnteAtual = voltsShunt / RESISTENCIA_SHUNT;
+      potenciaAtual = tensaoAtual * correnteAtual;
+      if (sdOK && !gravarMedicao(data, agora, tensaoAtual, voltsShunt * 1000.0f,
+                                correnteAtual, potenciaAtual)) {
+        sdOK = false; Serial.println("Falha SD: gravacao interrompida. Verifique o cartao.");
+      }
+      Serial.printf("%s | Tensao: %.3f V | Corrente: %.3f A | Potencia: %.3f W | SD: %s | WiFi: %s | FS: %s\n",
+        data, tensaoAtual, correnteAtual, potenciaAtual,
+        sdOK && logAlertasOK ? "OK" : "ERRO", WiFi.status() == WL_CONNECTED ? "OK" : "DESCONECTADO",
+        fsOK ? "OK" : "ERRO");
+    }
+    avaliarAlarme(leituraAtualOK, tensaoAtual, correnteAtual);
+    telaPendente = true;
   }
-  ultimaMedicao = agora;
-  char data[32], horario[24];
-  bool horaOK = obterHorario(data, sizeof(data), horario, sizeof(horario));
-  if (horaOK && !horaAnunciada) {
-    horaAnunciada = true;
-    Serial.print("Hora sincronizada: "); Serial.println(data);
+  if (telaPendente || agora - ultimaTela >= 200) {
+    apresentarTela(); ultimaTela = agora;
   }
-  uint16_t brutoBarramento, brutoShunt;
-  if (!lerRegistro16(0x02, brutoBarramento) ||
-      !lerRegistro16(0x01, brutoShunt)) {
-    Serial.println("Falha ao ler INA226.");
-    avaliarAlarme(false, 0, 0);
-    atualizarTela(false, 0, 0, 0, horario);
-    emitirAlarmeSeNecessario();
-    return;
-  }
-  float volts = brutoBarramento * 0.00125f;
-  float voltsShunt = (int16_t)brutoShunt * 0.0000025f;
-  float corrente = voltsShunt / RESISTENCIA_SHUNT;
-  float potencia = volts * corrente;
-  if (sdOK && !gravarMedicao(data, agora, volts, voltsShunt * 1000.0f,
-                             corrente, potencia)) {
-    sdOK = false;
-    Serial.println("Falha SD: gravacao interrompida. Verifique o cartao.");
-  }
-  Serial.print(data);
-  Serial.print(" | Tensao: "); Serial.print(volts, 3); Serial.print(" V");
-  Serial.print(" | Corrente: "); Serial.print(corrente, 3); Serial.print(" A");
-  Serial.print(" | Potencia: "); Serial.print(potencia, 3); Serial.print(" W");
-  Serial.print(sdOK && logAlertasOK ? " | SD: OK" : " | SD: ERRO");
-  Serial.println(WiFi.status() == WL_CONNECTED ? " | WiFi: OK"
-                                              : " | WiFi: DESCONECTADO");
-  avaliarAlarme(true, volts, corrente);
-  atualizarTela(true, volts, corrente, potencia, horario);
-  emitirAlarmeSeNecessario();
+  emitirAlarmeSeNecessario(); atualizarLEDs();
+  delay(1);
 }
