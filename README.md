@@ -1,10 +1,10 @@
 # Monitor de energia — NodeMCU / ESP8266
 
-Documentação da montagem de bancada validada em 03/10/2026.
+Documentação atualizada em **11/10/2026**, conforme o firmware `monitor_menu.ino` e os testes de bancada relatados. A última correção do menu foi compilada e testada em software; sua validação física ainda deve ser concluída.
 
 O projeto mede tensão, corrente e potência de um circuito de corrente contínua, apresenta as leituras em um OLED e grava o histórico em um cartão microSD. O Wi-Fi fornece sincronização opcional de data e hora. A medição, a gravação e a rotação dos arquivos funcionam sem conexão de rede.
 
-As configurações são feitas diretamente no [firmware monitor_rotacao.ino](monitor_rotacao.ino). Botões, encoder e expansor de entradas estão fora da montagem atual.
+Firmware atual: [monitor_menu.ino](monitor_menu.ino). Os limites e ajustes sonoros são definidos por três botões ligados ao MCP23017 e persistidos na memória interna LittleFS. Credenciais Wi-Fi, shunt, retenção e opções de hardware permanecem no código.
 
 ## 1. Recursos implementados
 
@@ -20,7 +20,15 @@ As configurações são feitas diretamente no [firmware monitor_rotacao.ino](mon
 - Sincronização NTP opcional no fuso de São Paulo.
 - Saída de diagnóstico na porta serial a 115200 baud.
 
-O buzzer está conectado e foi testado separadamente. O firmware atual o mantém inativo; ainda não há alarmes sonoros, menus, controle da carga, interface web ou cálculo de energia acumulada em Wh.
+- Menu com Anterior, Confirmar e Próximo, via MCP23017 em 0x20.
+- Configurações persistentes no LittleFS, independentes do cartão SD e do Wi-Fi.
+- Quatro LEDs: vermelho, amarelo, verde e azul, com estados simultâneos.
+- Alarmes de tensão baixa/crítica/alta, sobrecorrente, falha do INA226 e falha do SD.
+- Registro de transições de alarme e retorno à normalidade no SD.
+- Indicador de histórico de alertas no OLED e no LED amarelo.
+- Sequências sonoras temporizadas no loop, sem bloquear pelos períodos dos beeps.
+
+**Não há desligamento automático da carga**, interface web ou cálculo de energia acumulada em Wh. O alarme é um aviso; não substitui fusível ou proteção elétrica. Operações de cartão e o logo de inicialização ainda podem ocupar tempo no loop.
 
 ## 2. Placas, módulos e materiais
 
@@ -32,7 +40,13 @@ O buzzer está conectado e foi testado separadamente. O firmware atual o mantém
 | Tela | OLED SSD1306, 128 × 64, I²C, faixa amarela e azul | Apresentação das informações |
 | Adaptador microSD | HW-125, AMS1117-3.3 e 74LVC125A | Interface SPI do cartão |
 | Cartão | microSD, aproximadamente 16 GB, formatado e testado | Histórico em CSV |
-| Buzzer | Módulo de três pinos VCC, I/O e GND, marcado “Low Level Trigger” | Recurso sonoro reservado |
+| Expansor I²C | MCP23017, alimentado em 3,3 V, endereço 0x20 | Três botões e quatro LEDs |
+| Botões | Três push-buttons momentâneos, sem trava | Anterior, Confirmar e Próximo |
+| LEDs | Vermelho, amarelo, verde e azul | Indicação dos estados do firmware |
+| Resistores dos LEDs | Um por LED, nominal 1 kΩ; medido próximo de 960 Ω | Limitação da corrente |
+| Resistor RESET | Próximo de 10 kΩ; disponível de 9,7 kΩ | Pull-up do RESET do MCP23017 |
+| Buzzer atual | Módulo de três pinos, marcado High Level | Alarmes; configurado como ativo, HIGH liga / LOW desliga |
+| Buzzer futuro | Módulo passivo planejado, ainda não instalado | Variação de frequência e intensidade por PWM |
 | Fonte de bancada | Linksys LS120V10A, 12 V CC / 1 A, centro positivo | Alimentação do circuito sob medição |
 | Carga de teste | Cooler MXT de 12 V, 90 × 90 × 25 mm | Consumo usado na validação |
 | Proteção | Fusível de 1 A e porta-fusível | Proteção do circuito de teste |
@@ -43,18 +57,15 @@ O buzzer está conectado e foi testado separadamente. O firmware atual o mantém
 
 ## 3. Visão geral das conexões de sinal
 
-```mermaid
-flowchart TB
-    N["NodeMCU ESP8266"]
-    O["OLED SSD1306 — 0x3C"]
-    I["INA226 — 0x40"]
-    S["microSD HW-125"]
-    B["Buzzer — inativo"]
-    N -->|"D2 SDA / D1 SCL; I²C compartilhado"| O
-    N -->|"D2 SDA / D1 SCL; I²C compartilhado"| I
-    N -->|"D4 CS / D5 SCK / D7 MOSI / D6 MISO"| S
-    N -->|"D0 → I/O"| B
-```
+O OLED, INA226 e MCP23017 compartilham SDA e SCL. O microSD usa SPI e o buzzer tem sinal dedicado em D0. O MCP23017 evita ocupar os pinos SPI com os botões e LEDs.
+
+| Interface | NodeMCU | Dispositivos |
+|---|---|---|
+| I²C — SDA | D2 / GPIO4 | OLED, INA226 e MCP23017 |
+| I²C — SCL | D1 / GPIO5 | OLED, INA226 e MCP23017 |
+| SPI | D4 CS, D5 SCK, D6 MISO, D7 MOSI | microSD |
+| Sinal sonoro | D0 / GPIO16 | I/O do buzzer |
+| Entradas/saídas expandidas | GPA0–GPA2; GPB0–GPB3 | Botões; LEDs |
 
 O diagrama representa os sinais. As alimentações e o GND devem ser ligados conforme as tabelas seguintes.
 
@@ -63,15 +74,15 @@ O diagrama representa os sinais. As alimentações e o GND devem ser ligados con
 | Pino da placa | GPIO | Uso atual |
 |---|---:|---|
 | D0 | 16 | I/O do buzzer |
-| D1 | 5 | SCL do OLED e INA226 |
-| D2 | 4 | SDA do OLED e INA226 |
+| D1 | 5 | SCL do OLED, INA226 e MCP23017 |
+| D2 | 4 | SDA do OLED, INA226 e MCP23017 |
 | D3 | 0 | Sem uso no projeto |
 | D4 | 2 | CS do microSD |
 | D5 | 14 | SCK do microSD |
 | D6 | 12 | MISO do microSD |
 | D7 | 13 | MOSI do microSD |
 | D8 | 15 | Sem uso no projeto |
-| 3V / 3V3 | — | Alimentação de OLED, INA226 e buzzer |
+| 3V / 3V3 | — | Alimentação de OLED, INA226 e MCP23017 |
 | VU | — | 5 V USB, medidos na placa usada; alimentação do HW-125 |
 | G / GND | — | Referência comum |
 | A0, RX, TX | — | Sem conexões externas neste projeto |
@@ -126,17 +137,62 @@ O shunt externo tem resistência muito baixa: seu teste de continuidade normalme
 
 O módulo fotografado contém regulador de 3,3 V e buffer de sinais. A ligação de VCC a 5 V é específica deste adaptador; não corresponde a aplicar 5 V diretamente ao cartão ou aos GPIOs do ESP8266. O VU foi medido no NodeMCU utilizado e depende da alimentação USB. Conferir a placa antes de repetir essa ligação em outro modelo.
 
-D5, D6 e D7 ficam exclusivos dos sinais SPI nesta montagem. Os antigos botões não devem ser reconectados nesses pinos.
+D5, D6 e D7 ficam exclusivos dos sinais SPI nesta montagem. Os botões atuais ficam no MCP23017; não conectá-los nesses pinos SPI.
 
-### Buzzer
+### MCP23017 — alimentação e I²C
 
-| Pino do módulo | Conexão |
+| Pino/identificação da placa | Conexão |
 |---|---|
 | VCC | 3V3 do NodeMCU |
 | GND | GND comum |
-| I/O | D0 |
+| SDA / SI | D2 |
+| SCL / SCK | D1 |
+| RESET | Resistor de 9,7 kΩ ou 10 kΩ até 3V3; manter em nível alto |
+| A0, A1 e A2 de endereço, no cabeçalho de controle | GND: endereço 0x20 |
+| NC / SO e NC / CS | Sem conexão no uso I²C com MCP23017 |
+| ITA / ITB | Sem conexão; o firmware consulta os botões por polling |
 
-No teste realizado, um nível fixo produziu apenas um clique; um sinal alternado produziu som contínuo. O firmware atual define D0 em HIGH e mantém o buzzer inativo. A inscrição “Low Level Trigger” não basta, por si só, para determinar se o elemento sonoro é ativo ou passivo.
+Os **A0–A2 de endereço** são diferentes das portas **GPA0–GPA2** dos botões. A placa tem inscrições compartilhadas com a versão SPI MCP23S17; neste projeto o chip instalado e testado é MCP23017.
+
+Na foto da face com as inscrições `B0/A0` até `B7/A7`, na orientação em que `VCC/GND` fica no topo, a coluna esquerda corresponde a B e a direita a A. Conferir a serigrafia e a orientação antes de soldar.
+
+### Botões
+
+| Função | Porta MCP23017 | Ligação |
+|---|---|---|
+| Anterior | GPA0 / A0 da porta A | Botão entre GPA0 e GND |
+| Confirmar | GPA1 / A1 da porta A | Botão entre GPA1 e GND |
+| Próximo | GPA2 / A2 da porta A | Botão entre GPA2 e GND |
+
+O firmware habilita os pull-ups internos: solto = HIGH, pressionado = LOW. Há debounce de 35 ms. Em botões com quatro terminais, usar contatos que sejam unidos somente ao pressionar, identificados com continuidade sem alimentação.
+
+### LEDs — conexões
+
+| Cor | Porta MCP23017 | Caminho da ligação |
+|---|---|---|
+| Vermelho | GPB0 / B0 | GPB0 → resistor 1 kΩ → ânodo do LED; cátodo → GND |
+| Amarelo | GPB1 / B1 | GPB1 → resistor 1 kΩ → ânodo; cátodo → GND |
+| Verde | GPB2 / B2 | GPB2 → resistor 1 kΩ → ânodo; cátodo → GND |
+| Azul | GPB3 / B3 | GPB3 → resistor 1 kΩ → ânodo; cátodo → GND |
+
+Cada LED tem seu próprio resistor. HIGH acende; LOW apaga. O resistor não tem polaridade. Ânodo é o terminal positivo do LED; cátodo é o negativo. Se houver dúvida, identificar pelo teste de diodo do multímetro.
+
+### Buzzer atual — High Level
+
+| Pino do módulo | Conexão |
+|---|---|
+| VCC | Alimentação nominal especificada para o módulo atual; confirmar se 3,3 V ou 5 V antes de ligar |
+| GND | GND comum |
+| I/O | D0 |
+| Pull-down proposto | Resistor de 9,7 kΩ ou 10 kΩ entre I/O e GND, em paralelo ao sinal |
+
+A tensão de alimentação do novo módulo não foi documentada de forma suficiente para tratá-la como igual à do módulo antigo. Não aplicar 5 V diretamente a um GPIO do NodeMCU.
+
+O código atual usa `BUZZER_PASSIVO = false`: **HIGH liga e LOW desliga**. No modo ativo, frequência e volume dependem do elemento sonoro; o firmware controla duração, quantidade e intervalo dos beeps. A inscrição High Level indica a polaridade de acionamento, não comprova sozinha que o buzzer seja ativo.
+
+Durante o upload, o sketch não controla a saída. Foi proposto testar o resistor pull-down para evitar acionamento indesejado; sua instalação e eficácia ainda não foram confirmadas. Caso continue apitando, verificar a tensão e o circuito da entrada I/O.
+
+O módulo anterior Low Level foi descartado após dano nos pads. A futura substituição por um módulo passivo exige confirmar a polaridade e adaptar o acionamento antes de habilitar PWM; não basta trocar apenas a placa.
 
 ## 4. Esquemático do circuito medido — shunt no negativo
 
@@ -177,7 +233,7 @@ Os pads grandes do módulo INA226 não são usados para conduzir a corrente da c
 
 ### Alimentação da eletrônica
 
-O NodeMCU permanece alimentado pela USB. OLED, INA226 e buzzer usam o 3V3 do NodeMCU; o adaptador HW-125 usa o VU de 5 V USB. Todos compartilham o GND.
+O NodeMCU permanece alimentado pela USB. OLED, INA226 e MCP23017 usam o 3V3 do NodeMCU; o adaptador HW-125 usa o VU de 5 V USB. O buzzer usa a alimentação nominal do módulo instalado. Todos compartilham o GND.
 
 A fonte de 12 V alimenta o cooler. Seu negativo é unido ao GND da eletrônica no lado B do shunt. **Não conectar 12 V ao VCC do INA226, ao 3V3, ao VU, ao OLED ou aos GPIOs.** VBS é a entrada de medição de tensão, distinta de VCC.
 
@@ -215,21 +271,21 @@ Ambiente utilizado: Ubuntu, Arduino IDE 2.3.10 e suporte de placas ESP8266.
 1. Instalar o pacote de placas **esp8266 by ESP8266 Community** pelo Gerenciador de Placas. Quando necessário, usar a URL de índice indicada na documentação oficial: `https://arduino.esp8266.com/stable/package_esp8266com_index.json`.
 2. Selecionar **NodeMCU 1.0 (ESP-12E Module)** e a porta USB correspondente.
 3. Instalar **Adafruit GFX Library** e **Adafruit SSD1306**, incluindo as dependências solicitadas pela IDE.
-4. Usar `Wire`, `SPI`, `SD`, `ESP8266WiFi`, `time.h`, `TZ.h` e `sntp.h` fornecidos pelo ambiente do core ESP8266 compatível com o sketch.
-5. Abrir `monitor_rotacao.ino` dentro da pasta `monitor_rotacao`.
+4. Usar `Wire`, `SPI`, `SD`, `LittleFS`, `ESP8266WiFi`, `time.h`, `TZ.h` e `sntp.h` fornecidos pelo ambiente do core ESP8266 compatível com o sketch.
+5. Abrir `monitor_menu.ino` dentro da pasta `monitor_menu`. Selecionar Flash Size com espaço para filesystem, por exemplo **4MB (FS:1MB OTA:~1019KB)**, mantendo o mesmo layout usado no teste LittleFS.
 6. Ajustar as credenciais, verificar/compilar e enviar à placa.
 7. Abrir o Monitor Serial em **115200 baud**.
 
-Não é necessária uma biblioteca específica do INA226. SdFat foi usado no procedimento separado de formatação; não é dependência do firmware atual, que usa `SD.h`.
+Não são necessárias bibliotecas específicas do INA226 ou MCP23017; seus registradores são acessados diretamente por `Wire`. SdFat foi usado no procedimento separado de formatação; não é dependência do firmware atual, que usa `SD.h`.
 
-Não foi registrada a versão exata do core ESP8266 nem das bibliotecas Adafruit usadas no ensaio. Registrar essas versões ao consolidar uma versão reproduzível do projeto.
+A última versão foi compilada para `esp8266:esp8266:nodemcuv2:eesz=4M1M`, com core ESP8266 **3.1.2**, Arduino CLI **1.3.1**, Adafruit GFX **1.12.6**, Adafruit SSD1306 **2.5.17** e Adafruit BusIO **1.17.4**. Isso valida a compilação; não substitui ensaio físico. As versões instaladas no notebook podem ser diferentes.
 
 ## 7. Configurações no código
 
 | Item | Valor atual | Onde alterar |
 |---|---|---|
 | Rede Wi-Fi | `Cronin 2G` | `SSID` |
-| Senha Wi-Fi | Placeholder `SUA_SENHA` | `SENHA` |
+| Senha Wi-Fi | Placeholder `SENHA` | `SENHA` |
 | Intervalo entre medições | 1000 ms | `INTERVALO_MS` |
 | Medições por arquivo | 10.000 | `MAX_LINHAS_ARQUIVO` |
 | Arquivos retidos | 100 | `MAX_ARQUIVOS` |
@@ -238,7 +294,13 @@ Não foi registrada a versão exata do core ESP8266 nem das bibliotecas Adafruit
 | Endereço OLED | 0x3C | Argumento de `tela.begin()` |
 | Fuso | São Paulo | `TZ_America_Sao_Paulo` em `configTime()` |
 | Servidores NTP | `pool.ntp.org`, `time.cloudflare.com` | `configTime()` |
-| Tempo do logo | 3000 ms | `delay(3000)` em `mostrarLogo()` |
+| Tempo do logo | 3000 ms, além do beep inicial | `delay(3000)` em `mostrarLogo()` |
+| Tipo de buzzer | Ativo: `false` | `BUZZER_PASSIVO` |
+| Polaridade do buzzer | HIGH ligado, LOW desligado | `NIVEL_BUZZER_LIGADO`, `NIVEL_BUZZER_DESLIGADO` e implementação do acionamento |
+| Repetição do alarme | 15 segundos entre inícios de sequências | `REPETICAO_ALARME_MS` |
+| Confirmação de condição | 3 segundos | `CONFIRMACAO_CONDICAO_MS` |
+| Histerese de tensão | 0,20 V | `HISTERESE_TENSAO_V` |
+| Histerese de corrente | 0,05 A | `HISTERESE_CORRENTE_A` |
 
 Espaços no SSID são permitidos. A rede usada foi ajustada para segurança em modo misto e o NodeMCU conectou. O ESP8266 usa Wi-Fi de 2,4 GHz; não se conecta a uma rede exclusivamente de 5 GHz.
 
@@ -250,13 +312,14 @@ A conexão é iniciada sem bloquear a medição à espera da rede. Se não houve
 |---|---|
 | Cabeçalho esquerdo | `dd/mm`; antes da sincronização, `--/--` |
 | Cabeçalho central | `SD:OK` ou `SD:ERR` |
+| Antes do símbolo Wi-Fi | `!` quando o histórico consultado contém um alerta válido |
 | Cabeçalho direito | Símbolo Wi-Fi e quatro barras quando conectado |
 | Wi-Fi desconectado | Corte diagonal sobre o próprio símbolo, sem barras |
 | Primeira linha grande | `V:` — tensão em volts |
 | Segunda linha grande | `A:` — corrente em amperes |
 | Terceira linha grande | `W:` — potência em watts |
 
-As medições usam margens laterais e começam abaixo da faixa amarela. Valores excepcionalmente longos usam fonte menor para evitar cortes. Se a leitura do INA226 falhar, as três linhas mostram `---`.
+As medições usam margens laterais e começam abaixo da faixa amarela. Valores excepcionalmente longos usam fonte menor para evitar cortes. Durante um alarme, a linha de potência é substituída por “ALERTA” e sua descrição; V e A permanecem visíveis. Se a leitura do INA226 falhar, V e A mostram `---`, e o alerta informa a falha do sensor. O menu permanece aberto durante os alarmes, com `!` e a descrição no rodapé.
 
 A intensidade Wi-Fi é uma escala visual aproximada baseada em RSSI:
 
@@ -322,30 +385,38 @@ Sem hora válida, `data_hora_local` recebe `SEM_HORA` e a tela mostra `--/--`. A
 
 Após sincronização, o relógio do sistema continua avançando mesmo se o Wi-Fi cair, sujeito à deriva. Após reiniciar sem rede, a hora volta a depender de uma nova sincronização: não há RTC com bateria instalado.
 
-A rotação e a retenção nunca dependem da data/hora. A data mostrada na tela e escrita no CSV também não configura automaticamente a data de modificação dos arquivos no cartão; o sketch não instala callback de timestamp FAT.
+A rotação e a retenção nunca dependem da data/hora. As datas de modificação do sistema de arquivos não são usadas como critério para ordenar ou remover logs: o firmware utiliza o número no nome de cada CSV.
 
 ## 11. Validação e comportamento de falhas
 
 Resultados observados na bancada:
 
 - OLED exibindo corretamente as três medições; último ajuste de margens aprovado.
-- INA226 respondendo em 0x40, OLED em 0x3C.
+- INA226 em 0x40, OLED em 0x3C e MCP23017 em 0x20.
 - Leitura/escrita do cartão funcionando e CSV acessível no notebook.
 - Wi-Fi conectado após ajuste de segurança do ponto de acesso.
 - NTP sincronizado no fuso de São Paulo.
 - Cooler com tensão próxima de 11,98 V, corrente normalmente próxima de 0,20 A e potência próxima de 2,4 W.
-- Buzzer testado separadamente com sinal alternado.
+- Três botões e quatro LEDs do MCP23017 testados; contatos corrigidos por ressolda.
+- Menu e persistência do teste separado aprovados: salvar, cancelar e recuperar após desligar.
+- Primeira integração do menu ao monitor relatada como funcionando.
+- Correção para manter o menu durante alertas e atalho de desativação compilada e testada em software; aguardando confirmação física.
+- Módulo sonoro atual High Level instalado; substituição futura por passivo planejada.
 
 A lógica de limite de linhas e retenção foi testada em simulação no computador, incluindo a transição da medição 10.000 para a 10.001 e a manutenção de 100 logs. Isso não equivale a um ensaio prolongado no cartão físico.
 
 | Situação | Comportamento atual |
 |---|---|
 | Falha do OLED | Diagnóstico serial; medição e SD continuam |
-| Falha de leitura INA226 | Não grava a amostra; serial informa erro e tela mostra `---` |
+| Falha de leitura INA226 | Não grava a amostra; alarme imediato de sensor e aviso na tela |
 | Falha de inicialização do SD | Gravação desativada; medição e tela continuam |
 | Falha de abrir, escrever, criar ou remover log | Gravação interrompida; `SD:ERR` |
 | Wi-Fi indisponível | Medição, tela e SD continuam |
 | NTP indisponível | Usa `SEM_HORA` até obter hora válida |
+| LittleFS não monta | Padrões usados; salvar indisponível, `FS:ERR` no menu e LED vermelho |
+| Falha ao salvar configuração | Mantém os valores ativos anteriores e informa falha no menu/serial |
+| MCP23017 ausente na inicialização | Monitor continua; menu/botões ficam indisponíveis |
+| Falha de comunicação com MCP23017 em operação | Botões sem novas leituras e LEDs podem manter estados anteriores; diagnóstico serial |
 
 Depois de corrigir uma falha de SD, reiniciar o NodeMCU: a versão atual não tenta reinicializar o cartão automaticamente. `SD:OK` representa o resultado das operações do firmware, não uma verificação independente do conteúdo persistido.
 
@@ -363,25 +434,136 @@ Depois de corrigir uma falha de SD, reiniciar o NodeMCU: a versão atual não te
 | `SD:ERR` | Conferir VU, GND, SPI, cartão formatado, espaço e mensagens seriais |
 | `SEM_HORA` com Wi-Fi conectado | Conferir Internet, DNS e acesso a NTP; Wi-Fi conectado não garante sincronização |
 | Caracteres estranhos no início da serial | Mensagem de boot pode usar baud diferente; sketch opera em 115200 |
+| Menu não abre | Confirmar GPA1; MCP23017 em 0x20, RESET alto, VCC 3V3 e GND |
+| LED não acende | Conferir GPB correspondente, ânodo/cátodo, resistor próprio e soldas |
+| `FS:ERR` / falha ao salvar | Conferir layout de flash com FS > 0; preservar o filesystem preparado no teste |
+| Limites inconsistentes | Crítica menor que baixa, e alta maior que ambas, quando habilitadas |
+| Buzzer apita durante upload | Testar pull-down de 9,7/10 kΩ na entrada I/O; sketch não executa durante gravação |
 
 Revisar conexões de potência com fonte/bateria desconectada. Não medir resistência ou continuidade em um circuito energizado.
 
-## 13. Componentes descartados nesta versão
+## 13. Menu e configurações persistentes
 
-- Encoder rotativo Keyes: retirado após os testes de giro não fornecerem sequência útil.
-- Três botões momentâneos: testados, mas retirados da montagem atual.
-- PCF8574: proposto para futura expansão, não instalado.
-- LEDs externos: não usados.
+### Operação
 
-Nenhum desses componentes participa dos esquemas ou da configuração atual. Alterações de parâmetros são feitas no código e exigem novo upload.
+1. Na tela principal, pressionar **Confirmar** para abrir o menu.
+2. **Anterior/Próximo** navegam pelos itens. **Confirmar** abre a edição.
+3. Na edição, Anterior diminui e Próximo aumenta; Confirmar retorna à lista.
+4. **Salvar e sair** valida, grava, relê e aplica as escolhas.
+5. **Cancelar** descarta as alterações ainda não salvas.
+6. **Restaurar padrões** pede confirmação e modifica apenas o rascunho; depois é preciso escolher Salvar e sair.
 
-## 14. Referências oficiais
+Um `*` no cabeçalho do menu indica alteração pendente. Medições, CSVs e alarmes continuam durante a navegação. Um alarme **não fecha nem substitui o menu**: aparece `!` no cabeçalho e a descrição no rodapé. Mensagens temporárias do menu têm prioridade no rodapé.
+
+### Parâmetros
+
+| Parâmetro | Padrão | Ajuste / observação |
+|---|---|---|
+| Tensão baixa | DESATIVADO / 0 | Passos de 0,10 V; até 18,00 V |
+| Tensão crítica | DESATIVADO / 0 | Passos de 0,10 V; até 18,00 V; menor que baixa se ambas habilitadas |
+| Tensão alta | DESATIVADO / 0 | Passos de 0,10 V; até 36,00 V; maior que limites inferiores habilitados |
+| Corrente máxima | DESATIVADO / 0 | Passos de 0,10 A; até 20,00 A neste firmware/shunt |
+| Som dos alarmes | LIGADO | Também controla o beep de inicialização |
+| Duração do beep | 150 ms | 50–500 ms, passos de 25 ms; base dos padrões de alarme |
+| Frequência | 3000 Hz | Só aparece com `BUZZER_PASSIVO=true`; 500–4000 Hz, passos de 100 Hz |
+| Intensidade | 20% | Só aparece no modo passivo; 0–50%, passos de 1%; duty cycle, não dB |
+
+Zero desativa somente aquele limite. Ao aumentar um limite que estava desativado, o editor oferece inicialmente 11,50 V (baixa), 10,50 V (crítica), 15,00 V (alta) ou 1,00 A (corrente). **São pontos iniciais do editor, não recomendações de proteção para a bateria/rádio.** Não são aplicados sem salvar.
+
+### Voltar um limite para DESATIVADO
+
+Abra a edição de tensão baixa, crítica, alta ou corrente máxima e **segure Anterior por 1,2 segundo**. O valor vira DESATIVADO. Pressione Confirmar para retornar e escolha **Salvar e sair**. Cancelar mantém o limite ativo anterior. O atalho não afeta duração, som, frequência ou intensidade.
+
+### Armazenamento interno
+
+As configurações ficam em `/monitor_a.bin` e `/monitor_b.bin`, na **LittleFS da flash do NodeMCU**. Não ficam no cartão SD. O firmware alterna as cópias, usa versão/geração e checksum e relê o arquivo antes de aplicar. Uma escrita incompleta preserva a última cópia válida. Salvar sem alterações não regrava os valores já persistidos.
+
+Após reset ou desligamento, os valores são recuperados. Sem arquivo válido, são usados os padrões. O teste separado usa outros nomes de arquivo e seus valores não são importados. Os padrões continuam com todos os limites desativados.
+
+Mantenha o mesmo layout Flash Size com FS > 0 e evite apagar toda a flash. A versão principal **não formata automaticamente e não implementa o comando `FORMATAR_LITTLEFS`**. Esse comando pertence ao sketch separado de teste. Se necessário, preparar o filesystem com ele, ciente de que a formatação apaga todos os arquivos LittleFS, e voltar ao firmware principal com o mesmo layout. O SD não é formatado nesse procedimento.
+
+## 14. Significado dos LEDs
+
+Os LEDs **não alternam como no sketch de teste**. Podem ficar acesos ao mesmo tempo, porque representam estados independentes.
+
+| LED | Porta | Acende quando | Apaga quando |
+|---|---|---|---|
+| **Vermelho** | GPB0 | Há alarme ativo **ou LittleFS não montou** | Sem alarme ativo e LittleFS montada |
+| **Amarelo** | GPB1 | Há histórico de alerta detectado **ou alterações ainda não salvas no menu** | Sem histórico detectado e sem alterações pendentes |
+| **Verde** | GPB2 | A última leitura INA226 foi válida e não há alarme ativo | Leitura inválida ou alarme ativo |
+| **Azul** | GPB3 | Wi-Fi associado à rede | Wi-Fi desconectado |
+
+Exemplos:
+
+- **Verde + azul:** leitura válida, sem alarme ativo, Wi-Fi conectado.
+- **Verde + amarelo + azul:** situação normal com histórico de alerta ou uma edição pendente.
+- **Vermelho + amarelo:** pode haver alarme ativo com evento já registrado; verificar tela/serial para conhecer a causa.
+- **Vermelho + verde:** pode indicar falha de montagem da LittleFS enquanto a medição continua válida e sem outro alarme.
+
+O amarelo não prova sozinho que houve um alarme: também sinaliza edição pendente. O azul não garante acesso ao NTP/Internet. O verde não significa que todos os periféricos estejam saudáveis. Se o MCP23017 perder comunicação, os LEDs podem ficar no último estado e deixam de ser uma indicação atualizada.
+
+## 15. Alarmes e padrões sonoros
+
+Os limites começam desativados. Falhas de sensor e SD são monitoradas independentemente desses limites. O firmware mostra **um alarme prioritário por vez**; o arquivo registra transições desse alarme selecionado, não uma lista simultânea de todas as condições.
+
+Prioridade: **INA226 → sobrecorrente → bateria crítica → tensão alta → SD → bateria baixa**.
+
+| Alarme | Condição de entrada | Padrão sonoro |
+|---|---|---|
+| Bateria baixa | Tensão ≤ limite baixo habilitado | Dois curtos |
+| Bateria crítica | Tensão ≤ limite crítico habilitado | Três curtos |
+| Tensão alta | Tensão ≥ limite alto habilitado | Curto + longo |
+| Sobrecorrente | Valor absoluto da corrente ≥ limite habilitado | Dois longos |
+| Falha SD | Falha de medições ou do log de eventos | Longo + curto |
+| Falha INA226 | Leitura do sensor falhou | Quatro curtos |
+
+Com duração base de 150 ms: curto = 150 ms; longo de SD/tensão alta = 450 ms; longo de sobrecorrente = 600 ms. A sobrecorrente tem pausa de 600 ms entre os longos; os outros intervalos usam a duração base. A sequência repete aproximadamente a cada 15 segundos enquanto o alarme persistir, se o som estiver ligado.
+
+Condições de limite e retorno à normalidade passam pela confirmação de 3 segundos. Falha de sensor/SD e `ALARME_TESTE` são imediatos. Há histerese: uma tensão baixa/crítica precisa subir além do limite + 0,20 V; tensão alta precisa cair abaixo do limite − 0,20 V; sobrecorrente precisa cair abaixo do limite − 0,05 A, além da confirmação e da prioridade das outras condições.
+
+No modo ativo, **não existe regulagem de volume ou tom pelo menu**. Para o módulo passivo futuro, o PWM varia frequência e intensidade, mas a relação com o volume percebido depende do componente. O beep de inicialização dura 80 ms; no modo passivo usa 3500 Hz e 12% de duty cycle, definidos no código.
+
+`ALARME_TESTE` permite simular um alarme para ensaio; deve permanecer `SEM_ALARME` em uso normal. Nenhum padrão sonoro interrompe eletricamente a alimentação do rádio.
+
+## 16. Histórico de eventos no microSD
+
+| Arquivo | Conteúdo / retenção |
+|---|---|
+| `ALERTAS.CSV` | Transições atuais; rotaciona ao se aproximar de 1 MiB |
+| `ALERTOLD.CSV` | Geração anterior; substituída na próxima rotação |
+
+Cabeçalho:
+
+```csv
+data_hora_local,tempo_ms,arquivo_medicoes,estado,alarme_anterior,alarme_atual,leitura_ok,tensao_V,corrente_A,potencia_W
+```
+
+`estado` é `ALERTA` ao entrar/trocar de alarme ou `NORMAL` ao retornar à normalidade. O timestamp pode ser `SEM_HORA`; `tempo_ms` continua disponível. Os códigos são: 0 normal, 1 bateria baixa, 2 crítica, 3 SD, 4 sobrecorrente, 5 INA226, 6 tensão alta.
+
+Na inicialização, o firmware consulta até os **últimos 8192 bytes de cada um dos dois arquivos**. Só linhas completas reconhecidas como ALERTA contam; cabeçalho, arquivo vazio e fragmentos não contam. Um alerta registrado nesta execução também ativa o indicador. Alertas antigos fora dessa janela não são necessariamente reconhecidos após reiniciar.
+
+O `!` da tela principal e o histórico do LED amarelo permanecem após retorno espontâneo à normalidade. Não há reconhecimento/limpeza de histórico pelo menu. Para remover o indicador histórico, preservar uma cópia se desejado, remover os dois arquivos de eventos com o equipamento desligado e reiniciar. Isso não remove medições nem configurações LittleFS.
+
+Se o SD falhar, o firmware pode não conseguir registrar o próprio alarme de SD. Não interpretar ausência de evento no arquivo como prova de ausência de falha. A retenção dos eventos é separada dos 100 arquivos de medições.
+
+## 17. Componentes retirados e próximos ajustes
+
+- Encoder Keyes: retirado após os testes de giro; substituído pelos três botões.
+- PCF8574: opção discutida, não instalada; o expansor usado é MCP23017.
+- Módulo buzzer anterior Low Level: descartado após dano na placa.
+- Módulo passivo: compra/substituição futura; ainda não é a montagem atual.
+
+Botões e LEDs estão instalados e participam do firmware atual. O circuito de bateria/DC-DC e o dimensionamento definitivo do fusível do rádio não foram consolidados neste ensaio com cooler e USB.
+
+## 18. Referências oficiais
 
 - [INA226 — datasheet Texas Instruments](https://www.ti.com/lit/ds/symlink/ina226.pdf): entradas VBUS/IN+/IN− e fatores dos registros de tensão.
 - [ESP8266 Arduino Core — bibliotecas e interfaces](https://arduino-esp8266.readthedocs.io/en/latest/libraries.html): I²C, SPI e bibliotecas do core.
 - [ESP8266 Arduino Core — instalação](https://arduino-esp8266.readthedocs.io/en/latest/installing.html).
 - [ESP8266 Arduino Core — Wi-Fi Station](https://arduino-esp8266.readthedocs.io/en/latest/esp8266wifi/station-class.html): conexão e RSSI.
 - [Exemplo oficial NTP/TZ/DST](https://github.com/esp8266/Arduino/blob/master/libraries/esp8266/examples/NTP-TZ-DST/NTP-TZ-DST.ino).
+- [ESP8266 Arduino Core — LittleFS](https://arduino-esp8266.readthedocs.io/en/stable/filesystem.html): montagem e persistência na flash interna.
+- [MCP23017 — Microchip](https://www.microchip.com/en-us/product/MCP23017): expansor I²C de 16 portas.
 - [Adafruit SSD1306](https://github.com/adafruit/Adafruit_SSD1306) e [Adafruit GFX](https://github.com/adafruit/Adafruit-GFX-Library).
 
 As conexões de VU, o modelo dos módulos, a remoção do R100 e os resultados de bancada são específicos dos componentes e testes deste projeto. Conferir a serigrafia e o circuito ao substituir qualquer placa.
