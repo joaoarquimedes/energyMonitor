@@ -1,3 +1,4 @@
+// Correcao de temporizacao: pausas reais no logo e atendimento periodico ao SDK.
 #include <Arduino.h>
 #include <LittleFS.h>
 #include <stddef.h>
@@ -50,11 +51,20 @@ struct ConfigMonitorV1 {
   uint32_t checksum;
 };
 uint32_t checksumV1(const ConfigMonitorV1 &c);
+struct ConfigMonitorV2 {
+  uint32_t magic, versao, geracao;
+  uint16_t baixaCV, criticaCV, altaCV, maximaCA;
+  uint16_t som, duracaoMs, frequenciaHz, volume;
+  uint16_t rotacaoSeg, reservado;
+  uint32_t checksum;
+};
+uint32_t checksumV2(const ConfigMonitorV2 &c);
 struct ConfigMonitor {
   uint32_t magic, versao, geracao;
   uint16_t baixaCV, criticaCV, altaCV, maximaCA;
   uint16_t som, duracaoMs, frequenciaHz, volume;
   uint16_t rotacaoSeg, reservado;
+  uint16_t brilhoLED[4]; // Legado da versao 3: reservado, sem efeito nos LEDs.
   uint32_t checksum;
 };
 uint32_t checksumConfig(const ConfigMonitor &c);
@@ -69,10 +79,14 @@ void navegarTela(int sentido);
 void entrarMenuTela();
 void notificarAlarmeTela();
 void atualizarNavegacao();
+void atualizarLEDs();
+void enviarTela();
 enum Vista { VISTA_RESUMO, VISTA_TENSAO, VISTA_CORRENTE, VISTA_POTENCIA, VISTA_ALERTA };
 Vista vista = VISTA_RESUMO, vistaRetorno = VISTA_RESUMO;
 bool alertaForcado = false, alertaTelaPendente = false;
 uint32_t vistaEm = 0, cicloAlertaEm = 0;
+uint32_t ultimaInteracaoMenu = 0;
+const uint32_t INATIVIDADE_MENU_MS = 20000UL;
 const uint32_t PERIODO_TELA_ALERTA_MS = 30000UL;
 // Faixas visuais aproximadas para chumbo-acido 12 V. Nao medem capacidade,
 // saude nem carga real durante consumo/recarga. Ajustaveis somente no codigo.
@@ -120,7 +134,17 @@ uint32_t checksumV1(const ConfigMonitorV1 &c) {
   for (size_t n = 0; n < offsetof(ConfigMonitorV1, checksum); n++) h = (h ^ p[n]) * 16777619UL;
   return h;
 }
+uint32_t checksumV2(const ConfigMonitorV2 &c) {
+  const uint8_t *p = reinterpret_cast<const uint8_t *>(&c);
+  uint32_t h = 2166136261UL;
+  for (size_t n=0;n<offsetof(ConfigMonitorV2,checksum);n++) h=(h^p[n])*16777619UL;
+  return h;
+}
 bool validarConfig(const ConfigMonitor &c) {
+  for(uint8_t n=0;n<4;n++) {
+    uint16_t b=c.brilhoLED[n];
+    if(b!=5 && (b<10 || b>100 || b%10!=0)) return false;
+  }
   if (c.baixaCV > 1800 || c.criticaCV > 1800 || c.altaCV > 3600 ||
       c.maximaCA > 2000 || c.som > 1 || c.duracaoMs < 50 || c.duracaoMs > 500 ||
       c.frequenciaHz < 500 || c.frequenciaHz > 4000 || c.volume > 50 ||
@@ -140,6 +164,7 @@ ConfigMonitor padroesConfig() {
   ConfigMonitor c = {};
   // Limites 0 = desativados, preservando o comportamento do codigo recebido.
   c.som = 1; c.duracaoMs = 150; c.frequenciaHz = 3000; c.volume = 20;
+  for(uint8_t n=0;n<4;n++) c.brilhoLED[n]=100;
   return c;
 }
 bool lerConfig(int slot, ConfigMonitor &c) {
@@ -153,12 +178,22 @@ bool lerConfig(int slot, ConfigMonitor &c) {
         antiga.checksum != checksumV1(antiga)) return false;
     c = {};
     memcpy(&c, &antiga, offsetof(ConfigMonitorV1, checksum));
+    for(uint8_t n=0;n<4;n++) c.brilhoLED[n]=100;
     c.rotacaoSeg = 0; c.checksum = checksumConfig(c);
     return validarConfig(c);
   }
+  if(f.size()==sizeof(ConfigMonitorV2)) {
+    ConfigMonitorV2 antiga={};
+    bool ok=f.read(reinterpret_cast<uint8_t*>(&antiga),sizeof(antiga))==sizeof(antiga);
+    f.close();
+    if(!ok || antiga.magic!=0x4D4F4E49UL || antiga.versao!=2 || antiga.checksum!=checksumV2(antiga)) return false;
+    c={};memcpy(&c,&antiga,offsetof(ConfigMonitorV2,checksum));
+    for(uint8_t n=0;n<4;n++) c.brilhoLED[n]=100;
+    c.checksum=checksumConfig(c);return validarConfig(c);
+  }
   bool ok = f.size() == sizeof(c) && f.read(reinterpret_cast<uint8_t *>(&c), sizeof(c)) == sizeof(c);
   f.close();
-  return ok && c.magic == 0x4D4F4E49UL && c.versao == 2 &&
+  return ok && c.magic == 0x4D4F4E49UL && c.versao == 3 &&
     validarConfig(c) && c.checksum == checksumConfig(c);
 }
 void carregarConfiguracao() {
@@ -175,9 +210,9 @@ void carregarConfiguracao() {
 }
 bool salvarConfiguracao() {
   if (!fsOK || !validarConfig(edicao)) return false;
-  if (configSalva && configuracao.versao == 2 && mesmosValores(edicao, configuracao)) return true;
+  if (configSalva && configuracao.versao == 3 && mesmosValores(edicao, configuracao)) return true;
   ConfigMonitor nova = edicao;
-  nova.magic = 0x4D4F4E49UL; nova.versao = 2; nova.reservado = 0;
+  nova.magic = 0x4D4F4E49UL; nova.versao = 3; nova.reservado = 0;
   nova.geracao = configuracao.geracao + 1;
   nova.checksum = checksumConfig(nova);
   int destino = slotConfig == 0 ? 1 : 0;
@@ -264,13 +299,14 @@ void ajustarItem(int sentido) {
 }
 void botaoPressionado(uint8_t n) {
   telaPendente = true; cicloAlertaEm = vistaEm = millis();
+  ultimaInteracaoMenu = millis();
   alertaTelaPendente = false;
   if (pagina == TELA_PRINCIPAL) {
     if (n == 1) { entrarMenuTela(); edicao = configuracao; itemMenu = 0; pagina = LISTA_MENU; }
     else navegarTela(n == 0 ? -1 : 1);
   } else if (pagina == LISTA_MENU) {
     if (n != 1) itemMenu = proximoItem(itemMenu, n == 0 ? -1 : 1);
-    else if (itemMenu < 8 || itemMenu == 12) pagina = EDITAR_MENU;
+    else if (itemMenu < 8 || itemMenu >= 12) pagina = EDITAR_MENU;
     else if (itemMenu == 8) {
       if (!validarConfig(edicao)) avisarMenu("Limites inconsistentes");
       else if (!salvarConfiguracao()) avisarMenu("Falha salvar LittleFS");
@@ -303,6 +339,7 @@ void verificarBotoes() {
     return;
   }
   if (falhaMCP) { falhaMCP = false; telaPendente = true; }
+  if(pagina!=TELA_PRINCIPAL && (entradas&0x07)!=0x07) ultimaInteracaoMenu=agora;
   for (uint8_t n = 0; n < 3; n++) {
     bool nivel = (entradas & (1 << n)) != 0;
     if (nivel != botaoLido[n]) { botaoLido[n] = nivel; mudouBotaoEm[n] = agora; }
@@ -363,7 +400,7 @@ void desenharMenu() {
   else if (haAlarmeAtivo()) tela.print(textoAlarmeAtivo());
   else if (pagina == EDITAR_MENU && itemMenu <= 3) tela.print("Segure Anterior: OFF");
   else tela.print("Confirmar: selecionar");
-  tela.display();
+  enviarTela();
 }
 
 const uint32_t REPETICAO_ALARME_MS = 15000UL;
@@ -430,7 +467,10 @@ void atualizarSom() {
 }
 void beepInicializacao() {
   if (!configuracao.som) return;
-  acionarBuzzer(true, true); delay(80); silenciarBuzzer();
+  acionarBuzzer(true, true);
+  uint32_t inicio=millis();
+  while(millis()-inicio<80) {atualizarLEDs();delay(1);}
+  silenciarBuzzer();
 }
 const char *mensagemAlarme(TipoAlarme tipo) {
   switch (tipo) {
@@ -982,7 +1022,7 @@ void desenharTelaAlerta() {
   tela.setCursor(4, 39);tela.print(b);tela.setTextSize(1);
   tela.setCursor(4, 56);
   tela.print(alarmeAtual == SEM_ALARME ? "Confirmar: menu" : "Proximo: sair");
-  tela.display();
+  enviarTela();
 }
 void desenharTelaOperacao() {
   if (!oledOK) return;
@@ -1010,7 +1050,7 @@ void desenharTelaOperacao() {
       tela.setCursor(44, 49);tela.print("W");
     }
   }
-  tela.display();
+  enviarTela();
 }
 
 void mostrarLogo() {
@@ -1029,9 +1069,10 @@ void mostrarLogo() {
   tela.setTextSize(1);
   tela.setCursor(34, 50);
   tela.print("DE ENERGIA");
-  tela.display();
+  enviarTela();
   beepInicializacao();
-  delay(3000); // ESP8266 continua atendendo Wi-Fi durante delay().
+  uint32_t inicioLogo=millis();
+  while(millis()-inicioLogo<3000) {atualizarLEDs();delay(1);}
 }
 
 void desenharMedicao(char unidade, float valor, uint8_t y, bool valida) {
@@ -1056,6 +1097,9 @@ void setup() {
   pinMode(BUZZER, OUTPUT);
   Serial.begin(115200);
   delay(500);
+  Serial.println("\n=== MONITOR: CORRECAO WATCHDOG ===");
+  Serial.print("Motivo do reset: ");Serial.println(ESP.getResetReason());
+  Serial.println(ESP.getResetInfo());
   Wire.begin(D2, D1);
   carregarConfiguracao();
   Wire.setClock(100000);
@@ -1076,10 +1120,12 @@ void setup() {
   WiFi.setAutoReconnect(true);
   if (SSID[0]) WiFi.begin(SSID, SENHA);
   Serial.println("Aguardando Wi-Fi e horario NTP...");
+  Serial.println("Mostrando logo de inicializacao...");
   if (oledOK) mostrarLogo();
   else beepInicializacao();
   vistaEm = cicloAlertaEm = millis();
   desenharTelaOperacao();
+  Serial.println("Inicializacao concluida; iniciando medicoes.");
   ultimaMedicao = millis();
 }
 
@@ -1095,6 +1141,30 @@ void atualizarLEDs() {
   static uint8_t anterior = 0xFF;
   if (leds != anterior && escreverMCP(0x15, leds)) anterior = leds;
 }
+void verificarTempoMenu() {
+  if(pagina==TELA_PRINCIPAL || millis()-ultimaInteracaoMenu<INATIVIDADE_MENU_MS) return;
+  edicao=configuracao;pagina=TELA_PRINCIPAL;avisoMenu="";
+  vista=VISTA_RESUMO;alertaForcado=false;
+  vistaEm=cicloAlertaEm=millis();telaPendente=true;
+  // Um alarme surgido durante o menu conserva sua prioridade ao retornar.
+  Serial.println("Menu: retorno por inatividade; alteracoes pendentes descartadas.");
+}
+// Envio horizontal do framebuffer em blocos curtos, cedendo execucao ao SDK.
+void enviarTela() {
+  if(!oledOK) return;
+  Wire.setClock(400000);
+  Wire.beginTransmission((uint8_t)0x3C);Wire.write((uint8_t)0x00);
+  const uint8_t comandos[]={SSD1306_MEMORYMODE,0x00,SSD1306_PAGEADDR,0,7,SSD1306_COLUMNADDR,0,127};
+  for(uint8_t c:comandos) Wire.write(c);
+  bool ok=Wire.endTransmission()==0;
+  uint8_t *buffer=tela.getBuffer();
+  for(uint16_t pos=0;ok && pos<1024;pos+=16) {
+    Wire.beginTransmission((uint8_t)0x3C);Wire.write((uint8_t)0x40);
+    Wire.write(buffer+pos,(size_t)16);ok=Wire.endTransmission()==0;
+    if((pos%128)==112) yield();
+  }
+  Wire.setClock(100000);
+}
 void apresentarTela() {
   // O alerta nao retira o usuario do menu. No menu aparece ! e o texto
   // no rodape; som, medicoes e registros continuam ativos.
@@ -1104,7 +1174,10 @@ void apresentarTela() {
   telaPendente = false;
 }
 void loop() {
-  verificarWiFi(); verificarBotoes(); atualizarSom();
+  atualizarLEDs();verificarWiFi();
+  static uint32_t ultimaConsultaBotoes=0;
+  if(millis()-ultimaConsultaBotoes>=5) {ultimaConsultaBotoes=millis();verificarBotoes();}
+  verificarTempoMenu();atualizarSom();
   uint32_t agora = millis();
   static uint32_t ultimaTela = 0;
   if ((uint32_t)(agora - ultimaMedicao) >= INTERVALO_MS) {
@@ -1141,5 +1214,9 @@ void loop() {
     apresentarTela(); ultimaTela = agora;
   }
   emitirAlarmeSeNecessario(); atualizarLEDs();
-  delay(1);
+  // Pausa real periodica: delay(0) sozinho nao garante atendimento suficiente
+  // ao SDK/watchdog durante loops apertados com trafego I2C.
+  static uint32_t ultimaPausaSDK=0;
+  if(millis()-ultimaPausaSDK>=20) {delay(1);ultimaPausaSDK=millis();}
+  else yield();
 }
