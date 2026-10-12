@@ -22,7 +22,7 @@
 // Configuracoes na LittleFS; CSVs e eventos no SD. Nunca formata automaticamente.
 // Limites de alarme sao avisos: este codigo NAO corta a alimentacao da carga.
 // Altere as credenciais abaixo. Limites podem ser ajustados no menu.
-const char *SSID = "WIFI NAME";
+const char *SSID = "Cronin 2G";
 const char *SENHA = "SENHA";
 const uint8_t CS_SD = D4;
 const uint8_t BUZZER = D0;
@@ -43,10 +43,18 @@ uint32_t ultimaMedicao = 0;
 uint32_t linhasArquivo = 0;
 
 // Configuracoes persistentes do monitor (independentes do teste anterior).
+struct ConfigMonitorV1 {
+  uint32_t magic, versao, geracao;
+  uint16_t baixaCV, criticaCV, altaCV, maximaCA;
+  uint16_t som, duracaoMs, frequenciaHz, volume;
+  uint32_t checksum;
+};
+uint32_t checksumV1(const ConfigMonitorV1 &c);
 struct ConfigMonitor {
   uint32_t magic, versao, geracao;
   uint16_t baixaCV, criticaCV, altaCV, maximaCA;
   uint16_t som, duracaoMs, frequenciaHz, volume;
+  uint16_t rotacaoSeg, reservado;
   uint32_t checksum;
 };
 uint32_t checksumConfig(const ConfigMonitor &c);
@@ -56,7 +64,20 @@ ConfigMonitor padroesConfig();
 bool lerConfig(int slot, ConfigMonitor &c);
 bool haAlarmeAtivo();
 const char *textoAlarmeAtivo();
-enum PaginaMenu { TELA_PRINCIPAL, LISTA_MENU, EDITAR_MENU, RESTAURAR_MENU };
+bool reconhecerAlertas();
+void navegarTela(int sentido);
+void entrarMenuTela();
+void notificarAlarmeTela();
+void atualizarNavegacao();
+enum Vista { VISTA_RESUMO, VISTA_TENSAO, VISTA_CORRENTE, VISTA_POTENCIA, VISTA_ALERTA };
+Vista vista = VISTA_RESUMO, vistaRetorno = VISTA_RESUMO;
+bool alertaForcado = false, alertaTelaPendente = false;
+uint32_t vistaEm = 0, cicloAlertaEm = 0;
+const uint32_t PERIODO_TELA_ALERTA_MS = 30000UL;
+// Faixas visuais aproximadas para chumbo-acido 12 V. Nao medem capacidade,
+// saude nem carga real durante consumo/recarga. Ajustaveis somente no codigo.
+const float BAT_CHEIA_V = 12.70f, BAT_MEDIA_V = 12.30f, BAT_FIM_V = 11.90f;
+enum PaginaMenu { TELA_PRINCIPAL, LISTA_MENU, EDITAR_MENU, RESTAURAR_MENU, RECONHECER_MENU };
 ConfigMonitor configuracao = {}, edicao = {};
 PaginaMenu pagina = TELA_PRINCIPAL;
 bool fsOK = false, mcpOK = false, configSalva = false, falhaMCP = false;
@@ -77,10 +98,11 @@ const uint8_t NIVEL_BUZZER_DESLIGADO = LOW;
 const char *ITENS_MENU[] = {
   "Tensao baixa", "Tensao critica", "Tensao alta", "Corrente maxima",
   "Som dos alarmes", "Duracao do beep",
-  "Frequencia", "Intensidade", "Salvar e sair", "Cancelar", "Restaurar padroes"
+  "Frequencia", "Intensidade", "Salvar e sair", "Cancelar", "Restaurar padroes",
+  "Reconhecer alertas", "Rotacao de telas"
 };
 // Os indices 6 e 7 sao pulados se BUZZER_PASSIVO=false.
-const int TOTAL_ITENS = 11;
+const int TOTAL_ITENS = 13;
 uint16_t temposSom[9];
 uint8_t totalTemposSom = 0, passoSom = 0;
 uint32_t passoSomEm = 0;
@@ -92,10 +114,17 @@ uint32_t checksumConfig(const ConfigMonitor &c) {
   for (size_t n = 0; n < offsetof(ConfigMonitor, checksum); n++) h = (h ^ p[n]) * 16777619UL;
   return h;
 }
+uint32_t checksumV1(const ConfigMonitorV1 &c) {
+  const uint8_t *p = reinterpret_cast<const uint8_t *>(&c);
+  uint32_t h = 2166136261UL;
+  for (size_t n = 0; n < offsetof(ConfigMonitorV1, checksum); n++) h = (h ^ p[n]) * 16777619UL;
+  return h;
+}
 bool validarConfig(const ConfigMonitor &c) {
   if (c.baixaCV > 1800 || c.criticaCV > 1800 || c.altaCV > 3600 ||
       c.maximaCA > 2000 || c.som > 1 || c.duracaoMs < 50 || c.duracaoMs > 500 ||
-      c.frequenciaHz < 500 || c.frequenciaHz > 4000 || c.volume > 50) return false;
+      c.frequenciaHz < 500 || c.frequenciaHz > 4000 || c.volume > 50 ||
+      c.rotacaoSeg > 30 || c.rotacaoSeg % 5 != 0) return false;
   if (c.baixaCV && c.criticaCV && c.criticaCV >= c.baixaCV) return false;
   if (c.altaCV && ((c.baixaCV && c.altaCV <= c.baixaCV) ||
                   (c.criticaCV && c.altaCV <= c.criticaCV))) return false;
@@ -104,7 +133,8 @@ bool validarConfig(const ConfigMonitor &c) {
 bool mesmosValores(const ConfigMonitor &a, const ConfigMonitor &b) {
   return a.baixaCV == b.baixaCV && a.criticaCV == b.criticaCV &&
     a.altaCV == b.altaCV && a.maximaCA == b.maximaCA && a.som == b.som &&
-    a.duracaoMs == b.duracaoMs && a.frequenciaHz == b.frequenciaHz && a.volume == b.volume;
+    a.duracaoMs == b.duracaoMs && a.frequenciaHz == b.frequenciaHz && a.volume == b.volume &&
+    a.rotacaoSeg == b.rotacaoSeg;
 }
 ConfigMonitor padroesConfig() {
   ConfigMonitor c = {};
@@ -115,9 +145,20 @@ ConfigMonitor padroesConfig() {
 bool lerConfig(int slot, ConfigMonitor &c) {
   File f = LittleFS.open(CONFIG_FILES[slot], "r");
   if (!f) return false;
+  if (f.size() == sizeof(ConfigMonitorV1)) {
+    ConfigMonitorV1 antiga = {};
+    bool ok = f.read(reinterpret_cast<uint8_t *>(&antiga), sizeof(antiga)) == sizeof(antiga);
+    f.close();
+    if (!ok || antiga.magic != 0x4D4F4E49UL || antiga.versao != 1 ||
+        antiga.checksum != checksumV1(antiga)) return false;
+    c = {};
+    memcpy(&c, &antiga, offsetof(ConfigMonitorV1, checksum));
+    c.rotacaoSeg = 0; c.checksum = checksumConfig(c);
+    return validarConfig(c);
+  }
   bool ok = f.size() == sizeof(c) && f.read(reinterpret_cast<uint8_t *>(&c), sizeof(c)) == sizeof(c);
   f.close();
-  return ok && c.magic == 0x4D4F4E49UL && c.versao == 1 &&
+  return ok && c.magic == 0x4D4F4E49UL && c.versao == 2 &&
     validarConfig(c) && c.checksum == checksumConfig(c);
 }
 void carregarConfiguracao() {
@@ -134,9 +175,10 @@ void carregarConfiguracao() {
 }
 bool salvarConfiguracao() {
   if (!fsOK || !validarConfig(edicao)) return false;
-  if (configSalva && mesmosValores(edicao, configuracao)) return true;
+  if (configSalva && configuracao.versao == 2 && mesmosValores(edicao, configuracao)) return true;
   ConfigMonitor nova = edicao;
-  nova.magic = 0x4D4F4E49UL; nova.versao = 1; nova.geracao = configuracao.geracao + 1;
+  nova.magic = 0x4D4F4E49UL; nova.versao = 2; nova.reservado = 0;
+  nova.geracao = configuracao.geracao + 1;
   nova.checksum = checksumConfig(nova);
   int destino = slotConfig == 0 ? 1 : 0;
   File f = LittleFS.open(CONFIG_FILES[destino], "w");
@@ -187,6 +229,7 @@ int proximoItem(int item, int sentido) {
   return item;
 }
 String valorMenu() {
+  if (itemMenu == 12) return edicao.rotacaoSeg ? String(edicao.rotacaoSeg) + " s" : "DESATIVADO";
   uint16_t valor = itemMenu == 0 ? edicao.baixaCV : itemMenu == 1 ? edicao.criticaCV :
     itemMenu == 2 ? edicao.altaCV : edicao.maximaCA;
   if (itemMenu <= 3) {
@@ -199,6 +242,11 @@ String valorMenu() {
   return String(edicao.volume) + "%";
 }
 void ajustarItem(int sentido) {
+  if (itemMenu == 12) {
+    int indice = edicao.rotacaoSeg / 5;
+    edicao.rotacaoSeg = ((indice + sentido + 7) % 7) * 5;
+    return;
+  }
   int valor = 0, limite = 0;
   if (itemMenu <= 3) {
     uint16_t *alvo = itemMenu == 0 ? &edicao.baixaCV : itemMenu == 1 ? &edicao.criticaCV :
@@ -215,20 +263,29 @@ void ajustarItem(int sentido) {
   else edicao.volume = constrain((int)edicao.volume + sentido, 0, 50);
 }
 void botaoPressionado(uint8_t n) {
-  telaPendente = true;
+  telaPendente = true; cicloAlertaEm = vistaEm = millis();
+  alertaTelaPendente = false;
   if (pagina == TELA_PRINCIPAL) {
-    if (n == 1) { edicao = configuracao; itemMenu = 0; pagina = LISTA_MENU; }
+    if (n == 1) { entrarMenuTela(); edicao = configuracao; itemMenu = 0; pagina = LISTA_MENU; }
+    else navegarTela(n == 0 ? -1 : 1);
   } else if (pagina == LISTA_MENU) {
     if (n != 1) itemMenu = proximoItem(itemMenu, n == 0 ? -1 : 1);
-    else if (itemMenu < 8) pagina = EDITAR_MENU;
+    else if (itemMenu < 8 || itemMenu == 12) pagina = EDITAR_MENU;
     else if (itemMenu == 8) {
       if (!validarConfig(edicao)) avisarMenu("Limites inconsistentes");
       else if (!salvarConfiguracao()) avisarMenu("Falha salvar LittleFS");
       else { pagina = TELA_PRINCIPAL; avisarMenu("Configuracao salva"); }
     } else if (itemMenu == 9) { edicao = configuracao; pagina = TELA_PRINCIPAL; avisarMenu("Edicao cancelada"); }
-    else pagina = RESTAURAR_MENU;
+    else if (itemMenu == 10) pagina = RESTAURAR_MENU;
+    else pagina = RECONHECER_MENU;
   } else if (pagina == EDITAR_MENU) {
     if (n == 1) pagina = LISTA_MENU; else ajustarItem(n == 0 ? -1 : 1);
+  } else if (pagina == RECONHECER_MENU) {
+    if (n == 1) {
+      if (reconhecerAlertas()) avisarMenu("Historico reconhecido");
+      else avisarMenu("Falha ao gravar ACK");
+    }
+    pagina = LISTA_MENU;
   } else {
     if (n == 1) { edicao = padroesConfig(); avisarMenu("Padroes: falta salvar"); }
     pagina = LISTA_MENU;
@@ -292,6 +349,11 @@ void desenharMenu() {
     String valor = valorMenu(); tela.setTextSize(valor.length() > 10 ? 1 : 2);
     tela.setCursor(0, 29); tela.print(valor); tela.setTextSize(1);
     tela.setCursor(0, 47); tela.print("Anterior - Proximo +");
+  } else if (pagina == RECONHECER_MENU) {
+    tela.println("Reconhecer historico?");
+    tela.println("Confirmar: sim");
+    tela.println("Anterior/Proximo: nao");
+    tela.println("Nao encerra o alarme");
   } else {
     tela.println("Restaurar padroes?"); tela.println("Confirmar: sim");
     tela.println("Anterior/Proximo: nao"); tela.println("Depois escolha Salvar");
@@ -328,10 +390,10 @@ bool historicoAlertas = false;
 const char *ARQUIVO_ALERTAS = "/ALERTAS.CSV";
 const char *ARQUIVO_ALERTAS_ANTERIOR = "/ALERTOLD.CSV";
 const uint32_t MAX_BYTES_ALERTAS = 1024UL * 1024UL;
-const uint32_t JANELA_LEITURA_ALERTAS = 8192UL;
 // Prototipo explicito porque o registrador usa obterHorario(), definido adiante.
 bool registrarTransicaoAlarme(TipoAlarme anterior, TipoAlarme novo,
-                              bool leituraOK, float v, float i);
+                              bool leituraOK, float v, float i,
+                              bool reconhecimento);
 // Sequencia de duracoes ON/OFF atendida pelo loop, sem delay de alarme.
 void silenciarBuzzer() {
   if (BUZZER_PASSIVO) analogWrite(BUZZER, 0);
@@ -436,9 +498,10 @@ void avaliarAlarme(bool leituraOK, float v, float i) {
       (imediato || (uint32_t)(agora - inicioCandidato) >= CONFIRMACAO_CONDICAO_MS)) {
     TipoAlarme anterior = alarmeAtual;
     alarmeAtual = novo;
+    notificarAlarmeTela();
     pararSom();
     telaPendente = true;
-    if (!registrarTransicaoAlarme(anterior, novo, leituraOK, v, i)) {
+    if (!registrarTransicaoAlarme(anterior, novo, leituraOK, v, i, false)) {
       Serial.println("Falha ao registrar transicao de alarme no SD.");
     }
     somAlarmePendente = novo != SEM_ALARME;
@@ -447,7 +510,7 @@ void avaliarAlarme(bool leituraOK, float v, float i) {
   }
 }
 
-// Chamar DEPOIS de atualizarTela(): o aviso fica visivel durante o beep.
+// Chamar DEPOIS de apresentarTela(): o aviso fica visivel durante o beep.
 void emitirAlarmeSeNecessario() {
   if (alarmeAtual == SEM_ALARME || !configuracao.som || tocandoSom) return;
   if (somAlarmePendente ||
@@ -485,49 +548,49 @@ bool obterHorario(char *data, size_t tamanho, char *curto, size_t tamCurto) {
 
 // Verifica um registro completo do formato de eventos. Cabecalho, espacos
 // e fragmentos de escrita interrompida nao contam como alerta registrado.
-bool linhaContemAlerta(char *linha) {
+// 0: ignorar/NORMAL; 1: ALERTA; 2: ACK. Somente registros completos validos.
+uint8_t tipoHistoricoLinha(char *linha) {
   char *estado = linha;
   for (uint8_t campo = 0; campo < 3; ++campo) {
     estado = strchr(estado, ',');
-    if (!estado) return false;
+    if (!estado) return 0;
     ++estado;
   }
-  if (strncmp(estado, "ALERTA,", 7) != 0) return false;
+  uint8_t tipo;
+  const char *campos;
+  if (strncmp(estado, "ALERTA,", 7) == 0) { tipo = 1; campos = estado + 7; }
+  else if (strncmp(estado, "ACK,", 4) == 0) { tipo = 2; campos = estado + 4; }
+  else return 0;
   unsigned anterior, novo, leitura;
   char restante;
   // Estado, anterior, novo, leitura e tres valores; rejeita fragmentos.
   float v, i, p;
-  return sscanf(estado + 7, "%u,%u,%u,%f,%f,%f%c",
+  bool valido = sscanf(campos, "%u,%u,%u,%f,%f,%f%c",
                 &anterior, &novo, &leitura, &v, &i, &p, &restante) == 6 &&
-         anterior <= TENSAO_ALTA && novo > SEM_ALARME &&
-         novo <= TENSAO_ALTA && leitura <= 1;
+         anterior <= TENSAO_ALTA && novo <= TENSAO_ALTA && leitura <= 1 &&
+         (tipo == 2 || novo > SEM_ALARME) && isfinite(v) && isfinite(i) && isfinite(p);
+  return valido ? tipo : 0;
 }
 
-bool arquivoTemAlerta(const char *nome) {
-  if (!SD.exists(nome)) return false;
+bool aplicarHistoricoArquivo(const char *nome, bool &pendente) {
+  if (!SD.exists(nome)) return true;
   File arquivo = SD.open(nome, FILE_READ);
   if (!arquivo) { logAlertasOK = false; return false; }
-  uint32_t tamanho = arquivo.size();
-  uint32_t inicio = tamanho > JANELA_LEITURA_ALERTAS ?
-                    tamanho - JANELA_LEITURA_ALERTAS : 0;
-  if (inicio > 0) {
-    if (!arquivo.seek(inicio - 1)) {
-      arquivo.close(); logAlertasOK = false; return false;
-    }
-    // Se caiu no meio de uma linha, ignora somente o fragmento inicial.
-    if (arquivo.read() != '\n') {
-      while (arquivo.available() && arquivo.read() != '\n') yield();
-    }
-  }
+  // Leitura completa em ordem: um ACK pode estar fora da antiga janela
+  // de 8192 bytes. Memoria fixa; yield permite atender ao ESP8266.
   char linha[192];
   size_t posicao = 0;
-  bool excedeu = false, encontrou = false;
+  bool excedeu = false, sucesso = true;
   while (arquivo.available()) {
     int c = arquivo.read();
-    if (c < 0) { logAlertasOK = false; break; }
+    if (c < 0) { logAlertasOK = false; sucesso = false; break; }
     if (c == '\n') {
       linha[posicao] = '\0';
-      if (!excedeu && linhaContemAlerta(linha)) { encontrou = true; break; }
+      if (!excedeu) {
+        uint8_t tipo = tipoHistoricoLinha(linha);
+        if (tipo == 1) pendente = true;
+        else if (tipo == 2) pendente = false;
+      }
       posicao = 0; excedeu = false;
     } else if (c != '\r') {
       if (posicao < sizeof(linha) - 1) linha[posicao++] = (char)c;
@@ -536,17 +599,17 @@ bool arquivoTemAlerta(const char *nome) {
     yield();
   }
   arquivo.close();
-  return encontrou;
+  return sucesso;
 }
 
 void carregarHistoricoAlertas() {
   historicoAlertas = false;
   if (!cartaoInicializado) return;
-  bool atual = arquivoTemAlerta(ARQUIVO_ALERTAS);
-  bool anterior = arquivoTemAlerta(ARQUIVO_ALERTAS_ANTERIOR);
-  historicoAlertas = atual || anterior;
-  Serial.println(historicoAlertas ? "Historico: existem alertas registrados."
-                                 : "Historico: sem alertas registrados.");
+  // ALERTOLD e a copia anterior; ALERTAS e posterior, mesmo sem NTP.
+  aplicarHistoricoArquivo(ARQUIVO_ALERTAS_ANTERIOR, historicoAlertas);
+  aplicarHistoricoArquivo(ARQUIVO_ALERTAS, historicoAlertas);
+  Serial.println(historicoAlertas ? "Historico: alertas ainda nao reconhecidos."
+                                 : "Historico: nenhum alerta pendente de reconhecimento.");
 }
 
 // Mantem somente o arquivo atual e a geracao anterior, ate 1 MiB cada.
@@ -579,14 +642,14 @@ bool rotacionarAlertas() {
 }
 
 bool registrarTransicaoAlarme(TipoAlarme anterior, TipoAlarme novo,
-                              bool leituraOK, float v, float i) {
+                              bool leituraOK, float v, float i, bool reconhecimento) {
   if (!cartaoInicializado) { logAlertasOK = false; return false; }
   char data[32], curto[24], linha[192];
   obterHorario(data, sizeof(data), curto, sizeof(curto));
   int tamanho = snprintf(linha, sizeof(linha),
       "%s,%lu,%s,%s,%u,%u,%u,%.3f,%.6f,%.6f\n", data,
       (unsigned long)millis(), nomeArquivo[0] ? nomeArquivo + 1 : "SEM_CSV",
-      novo == SEM_ALARME ? "NORMAL" : "ALERTA",
+      reconhecimento ? "ACK" : novo == SEM_ALARME ? "NORMAL" : "ALERTA",
       (unsigned)anterior, (unsigned)novo, leituraOK ? 1U : 0U,
       leituraOK ? v : 0.0f, leituraOK ? i : 0.0f,
       leituraOK ? v * i : 0.0f);
@@ -627,10 +690,30 @@ bool registrarTransicaoAlarme(TipoAlarme anterior, TipoAlarme novo,
   }
   if (sucesso) sucesso = arquivo.write((const uint8_t *)linha, tamanho)
                         == (size_t)tamanho;
+  arquivo.flush();
   arquivo.close();
+  if (sucesso && reconhecimento) {
+    // Confirma que o ACK completo pode ser relido antes de apagar o indicador.
+    File conferir = SD.open(ARQUIVO_ALERTAS, FILE_READ);
+    sucesso = conferir && conferir.size() >= (uint32_t)tamanho &&
+      conferir.seek(conferir.size() - tamanho);
+    for (int n = 0; sucesso && n < tamanho; n++) sucesso = conferir.read() == (uint8_t)linha[n];
+    if (conferir) conferir.close();
+  }
   logAlertasOK = sucesso;
-  if (sucesso && novo != SEM_ALARME) historicoAlertas = true;
+  if (sucesso && reconhecimento) historicoAlertas = false;
+  else if (sucesso && novo != SEM_ALARME) historicoAlertas = true;
   return sucesso;
+}
+
+bool reconhecerAlertas() {
+  // Reconhece o historico, sem encerrar/silenciar o alarme atualmente ativo.
+  // O proximo ALERTA registrado (inclusive reincidencia) torna a marca pendente.
+  if (!cartaoInicializado) return false;
+  if (!registrarTransicaoAlarme(alarmeAtual, alarmeAtual, leituraAtualOK,
+                               tensaoAtual, correnteAtual, true)) return false;
+  telaPendente = true;
+  return true;
 }
 
 void verificarWiFi() {
@@ -753,32 +836,181 @@ bool gravarMedicao(const char *data, uint32_t tempo, float volts,
   return true;
 }
 
-// Quatro barras indicam o RSSI; os limiares sao uma escala visual aproximada.
+// Navegacao independente do menu; temporizadores seguros no rollover de millis.
+void entrarMenuTela() {
+  if (alertaForcado) vista = vistaRetorno;
+  alertaForcado = false; alertaTelaPendente = false;
+  cicloAlertaEm = vistaEm = millis();
+}
+void navegarTela(int sentido) {
+  Vista anterior = vista;
+  if (anterior != VISTA_ALERTA) vistaRetorno = anterior;
+  vista = static_cast<Vista>((static_cast<int>(vista) + sentido + 5) % 5);
+  alertaTelaPendente = false;
+  alertaForcado = vista == VISTA_ALERTA && alarmeAtual != SEM_ALARME;
+  cicloAlertaEm = vistaEm = millis(); telaPendente = true;
+}
+void notificarAlarmeTela() {
+  if (alarmeAtual == SEM_ALARME) {
+    alertaTelaPendente = false;
+    if (alertaForcado) { vista = vistaRetorno; alertaForcado = false; }
+    cicloAlertaEm = vistaEm = millis();
+  } else alertaTelaPendente = true;
+  telaPendente = true;
+}
+void forcarTelaAlerta() {
+  if (vista != VISTA_ALERTA) vistaRetorno = vista;
+  vista = VISTA_ALERTA; alertaForcado = true; alertaTelaPendente = false;
+  vistaEm = millis(); telaPendente = true;
+}
+void atualizarNavegacao() {
+  if (pagina != TELA_PRINCIPAL) return;
+  uint32_t agora = millis();
+  if (alarmeAtual != SEM_ALARME) {
+    if (alertaTelaPendente) { forcarTelaAlerta(); return; }
+    if (alertaForcado) {
+      if (agora - vistaEm >= PERIODO_TELA_ALERTA_MS) {
+        vista = vistaRetorno; alertaForcado = false;
+        cicloAlertaEm = vistaEm = agora; telaPendente = true;
+      }
+      return;
+    }
+    if (agora - cicloAlertaEm >= PERIODO_TELA_ALERTA_MS) { forcarTelaAlerta(); return; }
+  }
+  if (!alertaForcado && configuracao.rotacaoSeg &&
+      agora - vistaEm >= (uint32_t)configuracao.rotacaoSeg * 1000UL) {
+    vista = vista == VISTA_ALERTA ? VISTA_RESUMO :
+      static_cast<Vista>((static_cast<int>(vista) + 1) % 4);
+    vistaEm = agora; telaPendente = true;
+  }
+}
+
+// Somente as quatro barras de sinal. Sem simbolo de Wi-Fi redundante.
 void desenharWiFi() {
-  bool conectado = WiFi.status() == WL_CONNECTED;
-  // Icone de Wi-Fi, ao lado das barras.
-  tela.drawLine(89, 3, 92, 1, SSD1306_WHITE);
-  tela.drawLine(92, 1, 98, 1, SSD1306_WHITE);
-  tela.drawLine(98, 1, 101, 3, SSD1306_WHITE);
-  tela.drawLine(92, 5, 94, 4, SSD1306_WHITE);
-  tela.drawLine(94, 4, 96, 4, SSD1306_WHITE);
-  tela.drawLine(96, 4, 98, 5, SSD1306_WHITE);
-  tela.fillRect(95, 7, 2, 2, SSD1306_WHITE);
-  if (!conectado) {
-    // Corte diagonal sobre o proprio icone, com margem escura para contraste.
-    tela.drawLine(89, 9, 100, 0, SSD1306_BLACK);
-    tela.drawLine(91, 9, 102, 0, SSD1306_BLACK);
-    tela.drawLine(90, 9, 101, 0, SSD1306_WHITE);
-    return;
+  uint8_t barras = 0;
+  if (WiFi.status() == WL_CONNECTED) {
+    int32_t rssi = WiFi.RSSI();
+    barras = rssi >= -55 ? 4 : rssi >= -67 ? 3 : rssi >= -75 ? 2 : 1;
   }
-  int32_t rssi = WiFi.RSSI();
-  uint8_t barras = rssi >= -55 ? 4 : rssi >= -67 ? 3 : rssi >= -75 ? 2 : 1;
-  for (uint8_t n = 0; n < 4; ++n) {
-    int16_t x = 106 + n * 5;
-    int16_t altura = 2 + n * 2;
-    if (n < barras) tela.fillRect(x, 9 - altura, 4, altura, SSD1306_WHITE);
-    else tela.drawRect(x, 9 - altura, 4, altura, SSD1306_WHITE);
+  for (uint8_t n = 0; n < 4; n++) {
+    int16_t x = 106 + n * 5, h = 2 + n * 2;
+    if (n < barras) tela.fillRect(x, 9-h, 4, h, SSD1306_WHITE);
+    else tela.drawRect(x, 9-h, 4, h, SSD1306_WHITE);
   }
+}
+void cabecalhoTela(bool alerta) {
+  tela.clearDisplay(); tela.setTextWrap(false);
+  tela.setTextColor(SSD1306_WHITE); tela.setTextSize(1);
+  tela.setCursor(0, 0);
+  if (alerta) {
+    tela.drawTriangle(4, 10, 11, 0, 18, 10, SSD1306_WHITE);
+    tela.drawFastVLine(11, 3, 3, SSD1306_WHITE); tela.drawPixel(11, 8, SSD1306_WHITE);
+    tela.setCursor(24, 2); tela.print("ALERTA");
+  } else if (horarioAtual[0] >= '0' && horarioAtual[0] <= '9') {
+    for (uint8_t n=0; n<5; n++) tela.write(horarioAtual[n]);
+  } else tela.print("--/--");
+  if (!alerta) {
+    tela.setCursor(42, 0); tela.print(sdOK && logAlertasOK ? "SD:OK" : "SD:ERR");
+  }
+  if (historicoAlertas) { tela.setCursor(94, 0); tela.print('!'); }
+  desenharWiFi(); tela.drawFastHLine(4, 12, 120, SSD1306_WHITE);
+}
+int nivelBateria(float v, bool valida) {
+  if (!valida || !isfinite(v) || v < 2.0f) return -1;
+  if (v >= BAT_CHEIA_V) return 4;
+  if (v >= BAT_MEDIA_V) return 2;
+  if (v >= BAT_FIM_V) return 1;
+  return 0;
+}
+void desenharBateria(int nivel) {
+  tela.drawRoundRect(8, 24, 24, 33, 4, SSD1306_WHITE);
+  tela.fillRoundRect(15, 20, 10, 5, 2, SSD1306_WHITE);
+  if (nivel < 0) { tela.setCursor(17, 37); tela.print('?'); return; }
+  bool piscar = (millis()/600UL) % 2 == 0;
+  if (nivel == 0) {
+    if (piscar) { tela.setCursor(17, 37); tela.print('!'); }
+  } else {
+    for (int n=0; n<nivel; n++) {
+      if (nivel == 1 && !piscar) continue;
+      tela.fillRect(12, 49-n*7, 16, 5, SSD1306_WHITE);
+    }
+  }
+}
+void desenharTomada(bool consumo) {
+  // Cabo curvo e plugue, inspirados na referencia enviada.
+  tela.drawRoundRect(5, 22, 17, 14, 6, SSD1306_WHITE);
+  tela.fillRect(4, 29, 8, 9, SSD1306_BLACK);
+  tela.drawFastVLine(7, 32, 11, SSD1306_WHITE);
+  tela.drawFastHLine(7, 43, 9, SSD1306_WHITE);
+  tela.fillRoundRect(14, 38, 14, 17, 4, SSD1306_WHITE);
+  tela.fillRect(27, 41, 7, 3, SSD1306_WHITE);
+  tela.fillRect(27, 49, 7, 3, SSD1306_WHITE);
+  if (consumo) tela.fillCircle(6+(millis()/200UL)%4*5, 59, 1, SSD1306_WHITE);
+}
+void desenharRaio(bool consumo) {
+  bool cheio = !consumo || (millis()/500UL)%2 == 0;
+  if (cheio) {
+    tela.fillTriangle(26, 20, 8, 42, 21, 42, SSD1306_WHITE);
+    tela.fillTriangle(16, 37, 31, 37, 12, 58, SSD1306_WHITE);
+  } else {
+    tela.drawTriangle(26, 20, 8, 42, 21, 42, SSD1306_WHITE);
+    tela.drawTriangle(16, 37, 31, 37, 12, 58, SSD1306_WHITE);
+  }
+}
+void valorGrandeDireita(float valor, bool valida) {
+  char texto[24];
+  if (valida && isfinite(valor)) snprintf(texto, sizeof(texto), "%.3f", valor);
+  else snprintf(texto, sizeof(texto), "---");
+  uint8_t escala = strlen(texto)*12 <= 84 ? 2 : 1;
+  tela.setTextSize(escala);
+  tela.setCursor(124-strlen(texto)*6*escala, 29+(escala==1?4:0)); tela.print(texto);
+  tela.setTextSize(1);
+}
+void desenharTelaAlerta() {
+  cabecalhoTela(true);
+  const char *a="SEM", *b="ALERTAS";
+  switch(alarmeAtual) {
+    case BATERIA_BAIXA: a="BATERIA";b="BAIXA";break;
+    case BATERIA_CRITICA: a="BATERIA";b="CRITICA";break;
+    case TENSAO_ALTA: a="TENSAO";b="ALTA";break;
+    case SOBRECORRENTE: a="SOBRE";b="CORRENTE";break;
+    case ERRO_SD: a="ERRO NO";b="CARTAO SD";break;
+    case FALHA_INA226: a="FALHA NO";b="INA226";break;
+    default: if(historicoAlertas){a="HISTORICO";b="PENDENTE";} break;
+  }
+  tela.setTextSize(2); tela.setCursor(4, 20);tela.print(a);
+  tela.setCursor(4, 39);tela.print(b);tela.setTextSize(1);
+  tela.setCursor(4, 56);
+  tela.print(alarmeAtual == SEM_ALARME ? "Confirmar: menu" : "Proximo: sair");
+  tela.display();
+}
+void desenharTelaOperacao() {
+  if (!oledOK) return;
+  if (vista == VISTA_ALERTA) { desenharTelaAlerta(); return; }
+  cabecalhoTela(false);
+  if (vista == VISTA_RESUMO) {
+    desenharMedicao('V', tensaoAtual, 16, leituraAtualOK);
+    desenharMedicao('A', correnteAtual, 32, leituraAtualOK);
+    desenharMedicao('W', potenciaAtual, 48, leituraAtualOK);
+  } else {
+    tela.setCursor(44, 16);
+    if (vista == VISTA_TENSAO) {
+      tela.print("TENSAO"); int n=nivelBateria(tensaoAtual, leituraAtualOK);
+      desenharBateria(n); valorGrandeDireita(tensaoAtual, leituraAtualOK);
+      tela.setCursor(44, 49);tela.print("V ");
+      tela.print(n<0?"SEM BAT.":n==4?"CHEIA*":n==2?"MEDIA*":n==1?"P.FIM*":"VAZIA*");
+      tela.setCursor(44, 57);tela.print("*EST. TENSAO");
+    } else if (vista == VISTA_CORRENTE) {
+      tela.print("CORRENTE"); desenharTomada(leituraAtualOK && fabsf(correnteAtual)>0.05f);
+      valorGrandeDireita(correnteAtual, leituraAtualOK);
+      tela.setCursor(44, 49);tela.print("A");
+    } else {
+      tela.print("POTENCIA");desenharRaio(leituraAtualOK && fabsf(potenciaAtual)>0.10f);
+      valorGrandeDireita(potenciaAtual, leituraAtualOK);
+      tela.setCursor(44, 49);tela.print("W");
+    }
+  }
+  tela.display();
 }
 
 void mostrarLogo() {
@@ -819,48 +1051,6 @@ void desenharMedicao(char unidade, float valor, uint8_t y, bool valida) {
   tela.print(texto);
 }
 
-void atualizarTela(bool leituraOK, float v, float i, float p,
-                   const char *horario) {
-  if (!oledOK) return;
-  tela.clearDisplay();
-  tela.setTextWrap(false);
-  tela.setTextColor(SSD1306_WHITE);
-  tela.setTextSize(1);
-  tela.setCursor(0, 0);
-  // obterHorario() fornece "dd/mm HH:MM:SS" quando ha hora valida.
-  if (horario[0] >= '0' && horario[0] <= '9') {
-    for (uint8_t n = 0; n < 5; ++n) tela.write(horario[n]);
-  } else {
-    tela.print("--/--");
-  }
-  tela.setCursor(44, 0);
-  tela.print(sdOK && logAlertasOK ? "SD:OK" : "SD:ERR");
-  if (historicoAlertas) {
-    tela.setCursor(82, 0);
-    tela.print('!');
-  }
-  desenharWiFi();
-  tela.drawFastHLine(4, 11, 120, SSD1306_WHITE);
-  // A faixa azul comeca em y=16. Fonte padrao: 14 pixels visiveis
-  // na escala 2, mais 2 pixels de espacamento entre as linhas.
-  desenharMedicao('V', v, 16, leituraOK);
-  desenharMedicao('A', i, 32, leituraOK);
-  if (alarmeAtual == SEM_ALARME) {
-    desenharMedicao('W', p, 48, leituraOK);
-  } else {
-    // Mantem V e A grandes. O alerta ocupa a linha inferior de potencia.
-    tela.fillRect(4, 48, 120, 8, SSD1306_WHITE);
-    tela.setTextSize(1);
-    tela.setTextColor(SSD1306_BLACK);
-    tela.setCursor(46, 48);
-    tela.print("ALERTA");
-    tela.setTextColor(SSD1306_WHITE);
-    tela.setCursor(4, 56);
-    tela.print(mensagemAlarme(alarmeAtual));
-  }
-  tela.display();
-}
-
 void setup() {
   digitalWrite(BUZZER, NIVEL_BUZZER_DESLIGADO);
   pinMode(BUZZER, OUTPUT);
@@ -888,7 +1078,8 @@ void setup() {
   Serial.println("Aguardando Wi-Fi e horario NTP...");
   if (oledOK) mostrarLogo();
   else beepInicializacao();
-  atualizarTela(false, 0, 0, 0, "NTP aguardando");
+  vistaEm = cicloAlertaEm = millis();
+  desenharTelaOperacao();
   ultimaMedicao = millis();
 }
 
@@ -908,7 +1099,7 @@ void apresentarTela() {
   // O alerta nao retira o usuario do menu. No menu aparece ! e o texto
   // no rodape; som, medicoes e registros continuam ativos.
   if (pagina == TELA_PRINCIPAL)
-    atualizarTela(leituraAtualOK, tensaoAtual, correnteAtual, potenciaAtual, horarioAtual);
+    desenharTelaOperacao();
   else desenharMenu();
   telaPendente = false;
 }
@@ -945,6 +1136,7 @@ void loop() {
     avaliarAlarme(leituraAtualOK, tensaoAtual, correnteAtual);
     telaPendente = true;
   }
+  atualizarNavegacao();
   if (telaPendente || agora - ultimaTela >= 200) {
     apresentarTela(); ultimaTela = agora;
   }
