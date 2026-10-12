@@ -1,8 +1,8 @@
 # Monitor de energia — NodeMCU / ESP8266
 
-Documentação atualizada em **11/10/2026**, conforme o firmware `monitor_menu.ino` e os testes de bancada relatados. A última correção do menu foi compilada e testada em software; sua validação física ainda deve ser concluída.
+Documentação atualizada em **12/10/2026**, conforme o firmware `monitor_menu.ino` e os testes de bancada relatados. A versão com navegação/rotação de telas foi compilada e testada em software e o layout foi renderizado com Adafruit GFX; sua validação física ainda deve ser concluída.
 
-O projeto mede tensão, corrente e potência de um circuito de corrente contínua, apresenta as leituras em um OLED e grava o histórico em um cartão microSD. O Wi-Fi fornece sincronização opcional de data e hora. A medição, a gravação e a rotação dos arquivos funcionam sem conexão de rede.
+O projeto mede tensão, corrente e potência de um circuito de corrente contínua, apresenta as leituras em um OLED e grava o históriCco em um cartão microSD. O Wi-Fi fornece sincronização opcional de data e hora. A medição, a gravação e a rotação dos arquivos funcionam sem conexão de rede.
 
 Firmware atual: [monitor_menu.ino](monitor_menu.ino). Os limites e ajustes sonoros são definidos por três botões ligados ao MCP23017 e persistidos na memória interna LittleFS. Credenciais Wi-Fi, shunt, retenção e opções de hardware permanecem no código.
 
@@ -10,7 +10,9 @@ Firmware atual: [monitor_menu.ino](monitor_menu.ino). Os limites e ajustes sonor
 
 - Leitura do INA226 por I²C, com shunt externo de 20 A / 75 mV.
 - Cálculo de corrente e potência no NodeMCU.
-- OLED com data, estado do SD, símbolo Wi-Fi e intensidade de sinal.
+- OLED com data, estado do SD e barras de intensidade do Wi-Fi, sem símbolo redundante.
+- Telas de resumo, tensão/bateria, corrente, potência e alerta; ícones à esquerda e valores à direita.
+- Rotação opcional de 5 a 30 segundos e prioridade de alertas em ciclos de 30 segundos.
 - Tensão, corrente e potência em fonte grande, com três casas decimais.
 - Logo de bateria e “Monitor de Energia” durante aproximadamente 3 segundos na inicialização.
 - Uma medição aproximadamente a cada segundo.
@@ -25,7 +27,8 @@ Firmware atual: [monitor_menu.ino](monitor_menu.ino). Os limites e ajustes sonor
 - Quatro LEDs: vermelho, amarelo, verde e azul, com estados simultâneos.
 - Alarmes de tensão baixa/crítica/alta, sobrecorrente, falha do INA226 e falha do SD.
 - Registro de transições de alarme e retorno à normalidade no SD.
-- Indicador de histórico de alertas no OLED e no LED amarelo.
+- Indicador de alertas ainda não reconhecidos no OLED e no LED amarelo.
+- Reconhecimento de alertas (ACK) pelo menu, registrado no SD e recuperado após reiniciar.
 - Sequências sonoras temporizadas no loop, sem bloquear pelos períodos dos beeps.
 
 **Não há desligamento automático da carga**, interface web ou cálculo de energia acumulada em Wh. O alarme é um aviso; não substitui fusível ou proteção elétrica. Operações de cartão e o logo de inicialização ainda podem ocupar tempo no loop.
@@ -284,7 +287,7 @@ A última versão foi compilada para `esp8266:esp8266:nodemcuv2:eesz=4M1M`, com 
 
 | Item | Valor atual | Onde alterar |
 |---|---|---|
-| Rede Wi-Fi | `Cronin 2G` | `SSID` |
+| Rede Wi-Fi | `WIFI_NAME` | `SSID` |
 | Senha Wi-Fi | Placeholder `SENHA` | `SENHA` |
 | Intervalo entre medições | 1000 ms | `INTERVALO_MS` |
 | Medições por arquivo | 10.000 | `MAX_LINHAS_ARQUIVO` |
@@ -312,14 +315,14 @@ A conexão é iniciada sem bloquear a medição à espera da rede. Se não houve
 |---|---|
 | Cabeçalho esquerdo | `dd/mm`; antes da sincronização, `--/--` |
 | Cabeçalho central | `SD:OK` ou `SD:ERR` |
-| Antes do símbolo Wi-Fi | `!` quando o histórico consultado contém um alerta válido |
-| Cabeçalho direito | Símbolo Wi-Fi e quatro barras quando conectado |
-| Wi-Fi desconectado | Corte diagonal sobre o próprio símbolo, sem barras |
+| Antes das barras Wi-Fi | `!` quando há alerta registrado depois do último reconhecimento (ACK) |
+| Cabeçalho direito | Quatro barras de intensidade; símbolo Wi-Fi removido |
+| Wi-Fi desconectado | Quatro barras vazias |
 | Primeira linha grande | `V:` — tensão em volts |
 | Segunda linha grande | `A:` — corrente em amperes |
 | Terceira linha grande | `W:` — potência em watts |
 
-As medições usam margens laterais e começam abaixo da faixa amarela. Valores excepcionalmente longos usam fonte menor para evitar cortes. Durante um alarme, a linha de potência é substituída por “ALERTA” e sua descrição; V e A permanecem visíveis. Se a leitura do INA226 falhar, V e A mostram `---`, e o alerta informa a falha do sensor. O menu permanece aberto durante os alarmes, com `!` e a descrição no rodapé.
+As medições usam margens laterais e começam abaixo da faixa amarela. Valores excepcionalmente longos usam fonte menor para evitar cortes. A tela resumo mantém V, A e W. Um alarme confirmado abre uma tela dedicada com triângulo no canto superior esquerdo, margens e descrição em fonte maior. O menu permanece aberto durante os alarmes, com `!` e a descrição no rodapé. Leituras inválidas são apresentadas como `---`.
 
 A intensidade Wi-Fi é uma escala visual aproximada baseada em RSSI:
 
@@ -330,7 +333,23 @@ A intensidade Wi-Fi é uma escala visual aproximada baseada em RSSI:
 | ≥ −75 e < −67 dBm | 2 |
 | < −75 dBm, ainda conectado | 1 |
 
-Conexão Wi-Fi não comprova acesso à Internet ou ao NTP. O ícone indica associação à rede, não conectividade externa.
+Conexão Wi-Fi não comprova acesso à Internet ou ao NTP. As barras indicam associação/intensidade da rede, não conectividade externa.
+
+### Navegação das telas
+
+Na operação, **Próximo/Anterior** percorrem: resumo V/A/W → tensão e bateria → corrente → potência → alertas. **Confirmar** abre o menu. A navegação manual permanece disponível com a rotação automática desligada.
+
+As telas individuais usam ícone à esquerda e valor à direita, com fonte reduzida somente para números longos. A tomada mostra pontos em movimento quando há corrente acima de 0,05 A em módulo; o raio pulsa quando há potência acima de 0,10 W em módulo. São animações de atividade, não indicadores de recarga.
+
+A bateria vertical tem indicação **CHEIA*, MEDIA*, P.FIM* ou VAZIA***; os estados baixo/vazio piscam. O asterisco e `EST. TENSAO` indicam uma estimativa visual. Faixas iniciais no código: cheia ≥12,70 V; média ≥12,30 V; perto do fim ≥11,90 V; vazia abaixo de 11,90 V. Essas faixas não foram calibradas para a Moura 12MN300 e não são limites de proteção nem medição de capacidade/saúde. Consumo, temperatura, recarga e repouso influenciam a tensão; não usar a indicação como percentual exato. Abaixo de 2 V ou leitura inválida, o ícone mostra `?` e `SEM BAT.`.
+
+### Rotação e prioridade de alerta
+
+A rotação automática percorre somente as quatro telas de medições. Configure **Rotação de telas** e salve. O temporizador de rotação fica suspenso durante o menu e durante a apresentação forçada de um alerta.
+
+Ao confirmar um novo alarme pela lógica existente (imediato para falhas de sensor/SD; confirmação de 3 segundos para os limites), a tela de alerta abre no mesmo ciclo de atualização se o usuário estiver na operação. Sem ação, permanece 30 segundos, retorna à tela de medição anterior por 30 segundos e volta ao alerta, enquanto a condição persistir. Durante os 30 segundos de operação, a rotação configurada continua funcionando.
+
+Próximo/Anterior permitem sair do alerta e navegar; Confirmar abre o menu. Uma ação reinicia o intervalo de lembrete. Um novo tipo de alarme volta a solicitar atenção. Se a condição retorna à normalidade, a apresentação forçada é cancelada; o histórico/LED amarelo continuam conforme o ACK. O reconhecimento histórico não desativa a prioridade de um alarme ainda ativo. A tela de alertas também pode ser aberta manualmente para ver `SEM ALERTAS` ou `HISTORICO PENDENTE`.
 
 ## 9. CSV, rotação e retenção
 
@@ -452,6 +471,7 @@ Revisar conexões de potência com fonte/bateria desconectada. Não medir resist
 4. **Salvar e sair** valida, grava, relê e aplica as escolhas.
 5. **Cancelar** descarta as alterações ainda não salvas.
 6. **Restaurar padrões** pede confirmação e modifica apenas o rascunho; depois é preciso escolher Salvar e sair.
+7. **Reconhecer alertas** pede confirmação e grava um ACK imediatamente no SD. Anterior/Próximo cancelam essa confirmação. Não precisa escolher Salvar e sair para o ACK, nem altera o rascunho das configurações.
 
 Um `*` no cabeçalho do menu indica alteração pendente. Medições, CSVs e alarmes continuam durante a navegação. Um alarme **não fecha nem substitui o menu**: aparece `!` no cabeçalho e a descrição no rodapé. Mensagens temporárias do menu têm prioridade no rodapé.
 
@@ -465,6 +485,7 @@ Um `*` no cabeçalho do menu indica alteração pendente. Medições, CSVs e ala
 | Corrente máxima | DESATIVADO / 0 | Passos de 0,10 A; até 20,00 A neste firmware/shunt |
 | Som dos alarmes | LIGADO | Também controla o beep de inicialização |
 | Duração do beep | 150 ms | 50–500 ms, passos de 25 ms; base dos padrões de alarme |
+| Rotação de telas | DESATIVADO / 0 | Desativado, 5, 10, 15, 20, 25 ou 30 segundos por tela; aplicar em Salvar e sair |
 | Frequência | 3000 Hz | Só aparece com `BUZZER_PASSIVO=true`; 500–4000 Hz, passos de 100 Hz |
 | Intensidade | 20% | Só aparece no modo passivo; 0–50%, passos de 1%; duty cycle, não dB |
 
@@ -478,7 +499,7 @@ Abra a edição de tensão baixa, crítica, alta ou corrente máxima e **segure 
 
 As configurações ficam em `/monitor_a.bin` e `/monitor_b.bin`, na **LittleFS da flash do NodeMCU**. Não ficam no cartão SD. O firmware alterna as cópias, usa versão/geração e checksum e relê o arquivo antes de aplicar. Uma escrita incompleta preserva a última cópia válida. Salvar sem alterações não regrava os valores já persistidos.
 
-Após reset ou desligamento, os valores são recuperados. Sem arquivo válido, são usados os padrões. O teste separado usa outros nomes de arquivo e seus valores não são importados. Os padrões continuam com todos os limites desativados.
+Após reset ou desligamento, os valores são recuperados. Sem arquivo válido, são usados os padrões. O teste separado usa outros nomes de arquivo e seus valores não são importados. Os padrões continuam com todos os limites e a rotação de telas desativados. O formato de configuração passou à versão 2; arquivos válidos da versão 1 são convertidos em memória preservando os ajustes antigos e iniciando a rotação desativada. A próxima gravação salva o novo formato. Não formate a LittleFS para atualizar o firmware.
 
 Mantenha o mesmo layout Flash Size com FS > 0 e evite apagar toda a flash. A versão principal **não formata automaticamente e não implementa o comando `FORMATAR_LITTLEFS`**. Esse comando pertence ao sketch separado de teste. Se necessário, preparar o filesystem com ele, ciente de que a formatação apaga todos os arquivos LittleFS, e voltar ao firmware principal com o mesmo layout. O SD não é formatado nesse procedimento.
 
@@ -489,18 +510,18 @@ Os LEDs **não alternam como no sketch de teste**. Podem ficar acesos ao mesmo t
 | LED | Porta | Acende quando | Apaga quando |
 |---|---|---|---|
 | **Vermelho** | GPB0 | Há alarme ativo **ou LittleFS não montou** | Sem alarme ativo e LittleFS montada |
-| **Amarelo** | GPB1 | Há histórico de alerta detectado **ou alterações ainda não salvas no menu** | Sem histórico detectado e sem alterações pendentes |
+| **Amarelo** | GPB1 | Há alerta registrado ainda não reconhecido **ou alterações ainda não salvas no menu** | Histórico reconhecido/sem novos alertas e sem alterações pendentes |
 | **Verde** | GPB2 | A última leitura INA226 foi válida e não há alarme ativo | Leitura inválida ou alarme ativo |
 | **Azul** | GPB3 | Wi-Fi associado à rede | Wi-Fi desconectado |
 
 Exemplos:
 
 - **Verde + azul:** leitura válida, sem alarme ativo, Wi-Fi conectado.
-- **Verde + amarelo + azul:** situação normal com histórico de alerta ou uma edição pendente.
+- **Verde + amarelo + azul:** situação normal com alerta anterior ainda não reconhecido ou uma edição pendente.
 - **Vermelho + amarelo:** pode haver alarme ativo com evento já registrado; verificar tela/serial para conhecer a causa.
 - **Vermelho + verde:** pode indicar falha de montagem da LittleFS enquanto a medição continua válida e sem outro alarme.
 
-O amarelo não prova sozinho que houve um alarme: também sinaliza edição pendente. O azul não garante acesso ao NTP/Internet. O verde não significa que todos os periféricos estejam saudáveis. Se o MCP23017 perder comunicação, os LEDs podem ficar no último estado e deixam de ser uma indicação atualizada.
+O amarelo não prova sozinho que houve um alarme: também sinaliza edição pendente. Após reconhecer os alertas, ele pode continuar aceso se houver ajustes ainda não salvos; salve ou cancele a edição para apagar essa indicação. O azul não garante acesso ao NTP/Internet. O verde não significa que todos os periféricos estejam saudáveis. Se o MCP23017 perder comunicação, os LEDs podem ficar no último estado e deixam de ser uma indicação atualizada.
 
 ## 15. Alarmes e padrões sonoros
 
@@ -538,11 +559,17 @@ Cabeçalho:
 data_hora_local,tempo_ms,arquivo_medicoes,estado,alarme_anterior,alarme_atual,leitura_ok,tensao_V,corrente_A,potencia_W
 ```
 
-`estado` é `ALERTA` ao entrar/trocar de alarme ou `NORMAL` ao retornar à normalidade. O timestamp pode ser `SEM_HORA`; `tempo_ms` continua disponível. Os códigos são: 0 normal, 1 bateria baixa, 2 crítica, 3 SD, 4 sobrecorrente, 5 INA226, 6 tensão alta.
+`estado` é `ALERTA` ao entrar/trocar de alarme, `NORMAL` ao retornar à normalidade ou `ACK` quando o usuário reconhece os registros anteriores. No ACK, os campos de alarme anterior/atual registram o alarme ainda ativo, se houver; reconhecê-lo não muda esse estado. O timestamp pode ser `SEM_HORA`; `tempo_ms` continua disponível. Os códigos são: 0 normal, 1 bateria baixa, 2 crítica, 3 SD, 4 sobrecorrente, 5 INA226, 6 tensão alta.
 
-Na inicialização, o firmware consulta até os **últimos 8192 bytes de cada um dos dois arquivos**. Só linhas completas reconhecidas como ALERTA contam; cabeçalho, arquivo vazio e fragmentos não contam. Um alerta registrado nesta execução também ativa o indicador. Alertas antigos fora dessa janela não são necessariamente reconhecidos após reiniciar.
+Na inicialização, o firmware percorre os dois arquivos completos, primeiro `ALERTOLD.CSV` e depois `ALERTAS.CSV`, respeitando a ordem das gravações sem depender de NTP. `ALERTA` ativa a marcação; `ACK` limpa a marcação anterior; `NORMAL` não apaga alertas pendentes. Cabeçalhos, linhas inválidas e fragmentos incompletos são ignorados. A leitura usa um buffer fixo e atende ao ESP8266 com `yield()`. Até aproximadamente 2 MiB podem ser percorridos uma vez no boot, aumentando o tempo de inicialização quando há muitos eventos.
 
-O `!` da tela principal e o histórico do LED amarelo permanecem após retorno espontâneo à normalidade. Não há reconhecimento/limpeza de histórico pelo menu. Para remover o indicador histórico, preservar uma cópia se desejado, remover os dois arquivos de eventos com o equipamento desligado e reiniciar. Isso não remove medições nem configurações LittleFS.
+### Reconhecer alertas anteriores (ACK)
+
+Abra o menu, selecione **Reconhecer alertas** e pressione Confirmar novamente. O firmware grava e relê uma linha `ACK` antes de limpar a indicação histórica. O `!` da tela principal desaparece e o amarelo apaga se não houver edição pendente. Os registros anteriores são preservados para consulta; não há exclusão de arquivos nesse procedimento.
+
+O reconhecimento é persistente no SD e acompanha a rotação dos arquivos. Um novo `ALERTA` registrado depois do ACK — inclusive uma reincidência após retorno à normalidade — volta a mostrar `!` e acender o amarelo. Um alarme que permanece ativo continua vermelho, visível e com seus beeps; ACK não o encerra nem o silencia. Ao reiniciar com uma condição de alarme ainda presente, ela pode ser detectada e registrada novamente.
+
+Se a gravação/verificação do ACK falhar, a indicação não é limpa e o menu informa `Falha ao gravar ACK`. O cartão deve estar disponível para persistir o reconhecimento. Sem o SD/histórico correspondente, o reconhecimento não pode ser reconstruído. As configurações LittleFS não são modificadas pelo ACK.
 
 Se o SD falhar, o firmware pode não conseguir registrar o próprio alarme de SD. Não interpretar ausência de evento no arquivo como prova de ausência de falha. A retenção dos eventos é separada dos 100 arquivos de medições.
 
@@ -567,3 +594,5 @@ Botões e LEDs estão instalados e participam do firmware atual. O circuito de b
 - [Adafruit SSD1306](https://github.com/adafruit/Adafruit_SSD1306) e [Adafruit GFX](https://github.com/adafruit/Adafruit-GFX-Library).
 
 As conexões de VU, o modelo dos módulos, a remoção do R100 e os resultados de bancada são específicos dos componentes e testes deste projeto. Conferir a serigrafia e o circuito ao substituir qualquer placa.
+
+Referência para a limitação da estimativa por tensão: [Trojan Battery — FAQs](https://www.trojanbattery.com/resources/faqs). A leitura em circuito aberto/repouso é diferente da tensão durante consumo ou recarga; as faixas gráficas deste firmware são aproximações não calibradas.
