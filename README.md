@@ -1,8 +1,8 @@
 # Monitor de energia — NodeMCU / ESP8266
 
-Documentação atualizada em **12/10/2026**, conforme o firmware `monitor_menu.ino` e os testes de bancada relatados. A versão com navegação/rotação de telas foi compilada e testada em software e o layout foi renderizado com Adafruit GFX; sua validação física ainda deve ser concluída.
+Documentação atualizada em **12/10/2026**, conforme o firmware `monitor_menu.ino` e os testes de bancada relatados. A versão com brilho por LED, timeout e navegação/rotação de telas foi compilada e testada em software e o layout foi renderizado com Adafruit GFX; sua validação física ainda deve ser concluída.
 
-O projeto mede tensão, corrente e potência de um circuito de corrente contínua, apresenta as leituras em um OLED e grava o históriCco em um cartão microSD. O Wi-Fi fornece sincronização opcional de data e hora. A medição, a gravação e a rotação dos arquivos funcionam sem conexão de rede.
+O projeto mede tensão, corrente e potência de um circuito de corrente contínua, apresenta as leituras em um OLED e grava o histórico em um cartão microSD. O Wi-Fi fornece sincronização opcional de data e hora. A medição, a gravação e a rotação dos arquivos funcionam sem conexão de rede.
 
 Firmware atual: [monitor_menu.ino](monitor_menu.ino). Os limites e ajustes sonoros são definidos por três botões ligados ao MCP23017 e persistidos na memória interna LittleFS. Credenciais Wi-Fi, shunt, retenção e opções de hardware permanecem no código.
 
@@ -287,7 +287,7 @@ A última versão foi compilada para `esp8266:esp8266:nodemcuv2:eesz=4M1M`, com 
 
 | Item | Valor atual | Onde alterar |
 |---|---|---|
-| Rede Wi-Fi | `WIFI_NAME` | `SSID` |
+| Rede Wi-Fi | `Cronin 2G` | `SSID` |
 | Senha Wi-Fi | Placeholder `SENHA` | `SENHA` |
 | Intervalo entre medições | 1000 ms | `INTERVALO_MS` |
 | Medições por arquivo | 10.000 | `MAX_LINHAS_ARQUIVO` |
@@ -297,7 +297,7 @@ A última versão foi compilada para `esp8266:esp8266:nodemcuv2:eesz=4M1M`, com 
 | Endereço OLED | 0x3C | Argumento de `tela.begin()` |
 | Fuso | São Paulo | `TZ_America_Sao_Paulo` em `configTime()` |
 | Servidores NTP | `pool.ntp.org`, `time.cloudflare.com` | `configTime()` |
-| Tempo do logo | 3000 ms, além do beep inicial | `delay(3000)` em `mostrarLogo()` |
+| Tempo do logo | 3000 ms, além do beep inicial | Espera cooperativa em `mostrarLogo()`, atendendo ao PWM dos LEDs |
 | Tipo de buzzer | Ativo: `false` | `BUZZER_PASSIVO` |
 | Polaridade do buzzer | HIGH ligado, LOW desligado | `NIVEL_BUZZER_LIGADO`, `NIVEL_BUZZER_DESLIGADO` e implementação do acionamento |
 | Repetição do alarme | 15 segundos entre inícios de sequências | `REPETICAO_ALARME_MS` |
@@ -475,6 +475,10 @@ Revisar conexões de potência com fonte/bateria desconectada. Não medir resist
 
 Um `*` no cabeçalho do menu indica alteração pendente. Medições, CSVs e alarmes continuam durante a navegação. Um alarme **não fecha nem substitui o menu**: aparece `!` no cabeçalho e a descrição no rodapé. Mensagens temporárias do menu têm prioridade no rodapé.
 
+### Retorno automático por inatividade
+
+Em qualquer página do menu, após **20 segundos sem interação**, o firmware retorna ao resumo V/A/W. Alterações ainda não salvas são descartadas e o brilho volta aos valores persistidos. Pressionar/manter um botão reconhecido pelo MCP23017 mantém o menu ativo. O ACK, quando já confirmado e gravado, não é desfeito pelo timeout. O ciclo de alertas continua funcionando; um alarme surgido durante o menu conserva sua prioridade ao sair.
+
 ### Parâmetros
 
 | Parâmetro | Padrão | Ajuste / observação |
@@ -486,6 +490,10 @@ Um `*` no cabeçalho do menu indica alteração pendente. Medições, CSVs e ala
 | Som dos alarmes | LIGADO | Também controla o beep de inicialização |
 | Duração do beep | 150 ms | 50–500 ms, passos de 25 ms; base dos padrões de alarme |
 | Rotação de telas | DESATIVADO / 0 | Desativado, 5, 10, 15, 20, 25 ou 30 segundos por tela; aplicar em Salvar e sair |
+| Brilho vermelho | 100% | 5, 10, 20, 30, 40, 50, 60, 70, 80, 90 ou 100% |
+| Brilho amarelo | 100% | Mesmas opções; ajuste independente |
+| Brilho verde | 100% | Mesmas opções; ajuste independente |
+| Brilho azul | 100% | Mesmas opções; ajuste independente |
 | Frequência | 3000 Hz | Só aparece com `BUZZER_PASSIVO=true`; 500–4000 Hz, passos de 100 Hz |
 | Intensidade | 20% | Só aparece no modo passivo; 0–50%, passos de 1%; duty cycle, não dB |
 
@@ -499,7 +507,7 @@ Abra a edição de tensão baixa, crítica, alta ou corrente máxima e **segure 
 
 As configurações ficam em `/monitor_a.bin` e `/monitor_b.bin`, na **LittleFS da flash do NodeMCU**. Não ficam no cartão SD. O firmware alterna as cópias, usa versão/geração e checksum e relê o arquivo antes de aplicar. Uma escrita incompleta preserva a última cópia válida. Salvar sem alterações não regrava os valores já persistidos.
 
-Após reset ou desligamento, os valores são recuperados. Sem arquivo válido, são usados os padrões. O teste separado usa outros nomes de arquivo e seus valores não são importados. Os padrões continuam com todos os limites e a rotação de telas desativados. O formato de configuração passou à versão 2; arquivos válidos da versão 1 são convertidos em memória preservando os ajustes antigos e iniciando a rotação desativada. A próxima gravação salva o novo formato. Não formate a LittleFS para atualizar o firmware.
+Após reset ou desligamento, os valores são recuperados. Sem arquivo válido, são usados os padrões. O teste separado usa outros nomes de arquivo e seus valores não são importados. Os padrões continuam com todos os limites e a rotação de telas desativados. O formato de configuração passou à versão 3. Arquivos válidos das versões 1 e 2 são convertidos em memória preservando os ajustes antigos; a versão 1 começa com rotação desativada, e a versão 2 preserva seu intervalo. Ambos recebem brilho de 100% para as quatro cores. A próxima gravação salva o novo formato. Não formate a LittleFS para atualizar o firmware.
 
 Mantenha o mesmo layout Flash Size com FS > 0 e evite apagar toda a flash. A versão principal **não formata automaticamente e não implementa o comando `FORMATAR_LITTLEFS`**. Esse comando pertence ao sketch separado de teste. Se necessário, preparar o filesystem com ele, ciente de que a formatação apaga todos os arquivos LittleFS, e voltar ao firmware principal com o mesmo layout. O SD não é formatado nesse procedimento.
 
@@ -522,6 +530,14 @@ Exemplos:
 - **Vermelho + verde:** pode indicar falha de montagem da LittleFS enquanto a medição continua válida e sem outro alarme.
 
 O amarelo não prova sozinho que houve um alarme: também sinaliza edição pendente. Após reconhecer os alertas, ele pode continuar aceso se houver ajustes ainda não salvos; salve ou cancele a edição para apagar essa indicação. O azul não garante acesso ao NTP/Internet. O verde não significa que todos os periféricos estejam saudáveis. Se o MCP23017 perder comunicação, os LEDs podem ficar no último estado e deixam de ser uma indicação atualizada.
+
+### Intensidade independente dos LEDs
+
+No menu, use **Brilho vermelho**, **Brilho amarelo**, **Brilho verde** ou **Brilho azul**. As opções são **5%, 10%, 20%, 30%, 40%, 50%, 60%, 70%, 80%, 90% e 100%**, com 100% de padrão. Confirme a edição e escolha Salvar e sair para persistir. Durante a edição, o LED selecionado acende para prévia, mesmo que sua condição de estado esteja inativa. Essa prévia é temporária e não representa um novo alarme ou conexão Wi-Fi.
+
+As ligações GPB0–GPB3 e os resistores de 1 kΩ permanecem iguais. O MCP23017 não possui PWM dedicado: o firmware faz **PWM cooperativo por software, nominalmente 100 Hz**, com fases separadas por cor. Os percentuais representam o tempo nominal ligado, não uma medição de luminosidade nem uma escala perceptual calibrada. Somente os LEDs com estado ativo (ou em prévia) recebem pulsos.
+
+O OLED é enviado em blocos de 16 bytes, com atendimento dos LEDs entre transações I²C, a 400 kHz durante o envio e retorno a 100 kHz depois. O código não executa `Wire` em interrupções. Operações bloqueantes de SD, serial e Wi-Fi ainda podem alongar pulsos ou causar cintilação, especialmente em 5%; a uniformidade precisa ser avaliada na montagem real. 100% permanece aceso continuamente quando o estado está ativo. Para PWM estável independente do loop, a alternativa é um controlador dedicado, como PCA9685, com adaptação das conexões.
 
 ## 15. Alarmes e padrões sonoros
 
