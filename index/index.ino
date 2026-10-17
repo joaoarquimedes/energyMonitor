@@ -59,12 +59,22 @@ struct ConfigMonitorV2 {
   uint32_t checksum;
 };
 uint32_t checksumV2(const ConfigMonitorV2 &c);
+struct ConfigMonitorV3 {
+  uint32_t magic, versao, geracao;
+  uint16_t baixaCV, criticaCV, altaCV, maximaCA;
+  uint16_t som, duracaoMs, frequenciaHz, volume;
+  uint16_t rotacaoSeg, reservado;
+  uint16_t brilhoLED[4]; // Legado da versao 3: reservado, sem efeito nos LEDs.
+  uint32_t checksum;
+};
 struct ConfigMonitor {
   uint32_t magic, versao, geracao;
   uint16_t baixaCV, criticaCV, altaCV, maximaCA;
   uint16_t som, duracaoMs, frequenciaHz, volume;
   uint16_t rotacaoSeg, reservado;
   uint16_t brilhoLED[4]; // Legado da versao 3: reservado, sem efeito nos LEDs.
+  uint16_t capacidadeAh, reservaPct, perfilBat, eficienciaPct;
+  uint32_t identidadeBateria; // Muda somente ao trocar capacidade/perfil.
   uint32_t checksum;
 };
 uint32_t checksumConfig(const ConfigMonitor &c);
@@ -81,17 +91,23 @@ void notificarAlarmeTela();
 void atualizarNavegacao();
 void atualizarLEDs();
 void enviarTela();
-enum Vista { VISTA_RESUMO, VISTA_TENSAO, VISTA_CORRENTE, VISTA_POTENCIA, VISTA_ALERTA };
+void manterBateria();
+void textoAutonomia(char *texto,size_t n);
+void carregarBateria();
+void atualizarContagem(bool valida, float v, float i, uint32_t agora);
+bool salvarBateria();
+bool sincronizarBateria();
+void configuracaoBateriaMudou();
+float percentualBateria();
+void desenharTelaBateria();
+enum Vista { VISTA_RESUMO, VISTA_TENSAO, VISTA_CORRENTE, VISTA_POTENCIA, VISTA_BATERIA, VISTA_ALERTA };
 Vista vista = VISTA_RESUMO, vistaRetorno = VISTA_RESUMO;
 bool alertaForcado = false, alertaTelaPendente = false;
 uint32_t vistaEm = 0, cicloAlertaEm = 0;
 uint32_t ultimaInteracaoMenu = 0;
 const uint32_t INATIVIDADE_MENU_MS = 20000UL;
 const uint32_t PERIODO_TELA_ALERTA_MS = 30000UL;
-// Faixas visuais aproximadas para chumbo-acido 12 V. Nao medem capacidade,
-// saude nem carga real durante consumo/recarga. Ajustaveis somente no codigo.
-const float BAT_CHEIA_V = 12.70f, BAT_MEDIA_V = 12.30f, BAT_FIM_V = 11.90f;
-enum PaginaMenu { TELA_PRINCIPAL, LISTA_MENU, EDITAR_MENU, RESTAURAR_MENU, RECONHECER_MENU };
+enum PaginaMenu { TELA_PRINCIPAL, LISTA_MENU, EDITAR_MENU, RESTAURAR_MENU, RECONHECER_MENU, SINCRONIZAR_MENU };
 ConfigMonitor configuracao = {}, edicao = {};
 PaginaMenu pagina = TELA_PRINCIPAL;
 bool fsOK = false, mcpOK = false, configSalva = false, falhaMCP = false;
@@ -113,14 +129,162 @@ const char *ITENS_MENU[] = {
   "Tensao baixa", "Tensao critica", "Tensao alta", "Corrente maxima",
   "Som dos alarmes", "Duracao do beep",
   "Frequencia", "Intensidade", "Salvar e sair", "Cancelar", "Restaurar padroes",
-  "Reconhecer alertas", "Rotacao de telas"
+  "Reconhecer alertas", "Rotacao de telas",
+  "Bateria: Ah", "Perfil bateria", "Reserva minima", "Eficiencia recarga", "Bateria cheia"
 };
 // Os indices 6 e 7 sao pulados se BUZZER_PASSIVO=false.
-const int TOTAL_ITENS = 13;
+const int TOTAL_ITENS = 18;
 uint16_t temposSom[9];
 uint8_t totalTemposSom = 0, passoSom = 0;
 uint32_t passoSomEm = 0;
 bool tocandoSom = false;
+
+// BEGIN AH_MATH: independente de Wi-Fi, NTP, SD e LittleFS.
+struct EstadoBateria {
+  uint32_t magic, versao, geracao;
+  uint16_t capacidadeAh, perfilBat, sincronizada, reservado;
+  uint32_t alinhamento;
+  double restanteAh, retiradosAh, recebidosAh;
+  uint32_t identidadeBateria, checksum;
+};
+void integrarAh(EstadoBateria &e, double anterior, double atual, uint32_t dtMs, double eficiencia);
+uint32_t checksumBateria(const EstadoBateria &e);
+bool lerBateria(int slot,EstadoBateria &e);
+void integrarAh(EstadoBateria &e, double anterior, double atual, uint32_t dtMs, double eficiencia) {
+  double horas=dtMs/3600000.0, entrada=0, saida=0;
+  if(anterior>=0 && atual>=0) entrada=(anterior+atual)*0.5*horas;
+  else if(anterior<=0 && atual<=0) saida=-(anterior+atual)*0.5*horas;
+  else {
+    double fracao=fabs(anterior)/(fabs(anterior)+fabs(atual));
+    if(anterior>0) {entrada=anterior*0.5*horas*fracao;saida=-atual*0.5*horas*(1-fracao);}
+    else {saida=-anterior*0.5*horas*fracao;entrada=atual*0.5*horas*(1-fracao);}
+  }
+  e.retiradosAh+=saida;e.recebidosAh+=entrada;
+  if(e.sincronizada) {
+    e.restanteAh+=entrada*eficiencia-saida;
+    if(e.restanteAh<0) e.restanteAh=0;
+    if(e.restanteAh>e.capacidadeAh) e.restanteAh=e.capacidadeAh;
+  }
+}
+// END AH_MATH
+EstadoBateria bateria={};
+bool bateriaRetomada=false,bateriaPersistenciaOK=true,bateriaSuja=false;
+int slotBateria=-1;
+uint32_t ultimoSaveBateria=0,ultimaAmostraBateria=0,tempoMediaBateria=0;
+bool amostraBateriaAnterior=false;
+float correnteAnteriorBateria=0,mediaCorrenteBateria=0;
+// Filtro de zero APENAS para integracao: ajustar apos afericao do offset.
+const float ZONA_ZERO_A=0.010f;
+const uint32_t SALVAR_BATERIA_MS=300000UL,MAX_LACUNA_MS=5000UL;
+const char *BAT_FILES[2]={"/bat_a.bin","/bat_b.bin"};
+uint32_t checksumBateria(const EstadoBateria &e) {
+  const uint8_t *p=reinterpret_cast<const uint8_t*>(&e);uint32_t h=2166136261UL;
+  for(size_t n=0;n<offsetof(EstadoBateria,checksum);n++) h=(h^p[n])*16777619UL;
+  return h;
+}
+bool lerBateria(int slot,EstadoBateria &e) {
+  File f=LittleFS.open(BAT_FILES[slot],"r");if(!f) return false;
+  bool ok=f.size()==sizeof(e) && f.read(reinterpret_cast<uint8_t*>(&e),sizeof(e))==sizeof(e);f.close();
+  return ok && e.magic==0x42415441UL && e.versao==1 && e.checksum==checksumBateria(e) &&
+    e.capacidadeAh>=1 && e.capacidadeAh<=1000 && e.perfilBat<=1 && e.sincronizada<=1 &&
+    isfinite(e.restanteAh) && isfinite(e.retiradosAh) && isfinite(e.recebidosAh) &&
+    e.restanteAh>=0 && e.restanteAh<=e.capacidadeAh && e.retiradosAh>=0 && e.recebidosAh>=0;
+}
+bool salvarBateria() {
+  ultimoSaveBateria=millis();
+  if(!fsOK) {bateriaPersistenciaOK=false;return false;}
+  EstadoBateria nova=bateria;
+  nova.magic=0x42415441UL;nova.versao=1;nova.geracao=bateria.geracao+1;
+  nova.checksum=checksumBateria(nova);
+  int destino=slotBateria==0?1:0;
+  File f=LittleFS.open(BAT_FILES[destino],"w");
+  if(!f) {bateriaPersistenciaOK=false;return false;}
+  size_t n=f.write(reinterpret_cast<const uint8_t*>(&nova),sizeof(nova));f.flush();f.close();
+  EstadoBateria teste={};
+  bool ok=n==sizeof(nova) && lerBateria(destino,teste) && memcmp(&nova,&teste,sizeof(nova))==0;
+  bateriaPersistenciaOK=ok;
+  if(ok) {bateria=nova;slotBateria=destino;bateriaSuja=false;}
+  else Serial.println("Bateria: falha ao salvar checkpoint LittleFS.");
+  return ok;
+}
+void configuracaoBateriaMudou() {
+  uint32_t geracao=bateria.geracao;
+  bateria={};bateria.geracao=geracao;
+  bateria.capacidadeAh=configuracao.capacidadeAh;bateria.perfilBat=configuracao.perfilBat;
+  bateria.identidadeBateria=configuracao.identidadeBateria;
+  bateriaRetomada=false;amostraBateriaAnterior=false;tempoMediaBateria=0;mediaCorrenteBateria=0;
+  bateriaSuja=true;salvarBateria();
+  Serial.println("Bateria: nova capacidade/perfil; SOC desconhecido. Sincronize apos carga completa.");
+}
+void carregarBateria() {
+  bateria={};bateria.capacidadeAh=configuracao.capacidadeAh;bateria.perfilBat=configuracao.perfilBat;
+  EstadoBateria a={},b={};
+  bool va=fsOK && lerBateria(0,a),vb=fsOK && lerBateria(1,b);
+  if(va && (!vb || static_cast<int32_t>(a.geracao-b.geracao)>0)) {bateria=a;slotBateria=0;}
+  else if(vb) {bateria=b;slotBateria=1;}
+  if(bateria.capacidadeAh!=configuracao.capacidadeAh || bateria.perfilBat!=configuracao.perfilBat ||
+     bateria.identidadeBateria!=configuracao.identidadeBateria) {
+    configuracaoBateriaMudou();return;
+  }
+  bateriaRetomada=bateria.sincronizada;
+  bateriaPersistenciaOK=fsOK;ultimoSaveBateria=millis();
+  if(bateriaRetomada) Serial.println("Bateria: estimativa retomada; intervalo com monitor desligado nao contabilizado.");
+  else Serial.println("Bateria: carga desconhecida; contagem de Ah ativa apos leitura valida.");
+}
+void invalidarContagem() {
+  amostraBateriaAnterior=false;tempoMediaBateria=0;mediaCorrenteBateria=0;
+  if(bateria.sincronizada) {
+    bateria.sincronizada=0;bateriaSuja=true;salvarBateria();
+    Serial.println("Bateria: lacuna de medicao. SOC invalidado; sincronize novamente.");
+  }
+}
+void atualizarContagem(bool valida,float v,float i,uint32_t agora) {
+  if(!valida || !isfinite(v) || !isfinite(i) || v<2.0f) {invalidarContagem();return;}
+  float corrente=fabsf(i)<ZONA_ZERO_A?0:i;
+  if(amostraBateriaAnterior) {
+    uint32_t dt=agora-ultimaAmostraBateria;
+    if(dt>MAX_LACUNA_MS) invalidarContagem();
+    else if(dt) {
+      integrarAh(bateria,correnteAnteriorBateria,corrente,dt,configuracao.eficienciaPct/100.0);
+      float alfa=dt/(60000.0f+dt);
+      mediaCorrenteBateria+=(corrente-mediaCorrenteBateria)*alfa;
+      if(tempoMediaBateria<60000) tempoMediaBateria+=dt;
+      if(corrente || correnteAnteriorBateria) bateriaSuja=true;
+    }
+  }
+  if(!amostraBateriaAnterior) mediaCorrenteBateria=corrente;
+  correnteAnteriorBateria=corrente;ultimaAmostraBateria=agora;amostraBateriaAnterior=true;
+}
+void manterBateria() {
+  uint32_t prazo=bateriaPersistenciaOK?SALVAR_BATERIA_MS:60000UL;
+  if(bateriaSuja && millis()-ultimoSaveBateria>=prazo) salvarBateria();
+}
+bool sincronizarBateria() {
+  if(!fsOK || !leituraAtualOK || tensaoAtual<2 || !amostraBateriaAnterior ||
+     millis()-ultimaAmostraBateria>MAX_LACUNA_MS) return false;
+  EstadoBateria anterior=bateria;
+  bateria.restanteAh=configuracao.capacidadeAh;
+  bateria.retiradosAh=bateria.recebidosAh=0;bateria.sincronizada=1;bateriaSuja=true;
+  if(!salvarBateria()) {bateria=anterior;bateriaSuja=true;return false;}
+  bateriaRetomada=false;
+  Serial.println("Bateria: referencia 100% confirmada pelo usuario. Contadores do ciclo zerados.");
+  return true;
+}
+float percentualBateria() {
+  if(!bateria.sincronizada) return -1;
+  return constrain((float)(100.0*bateria.restanteAh/configuracao.capacidadeAh),0.0f,100.0f);
+}
+void textoAutonomia(char *texto,size_t n) {
+  if(percentualBateria()<0) {snprintf(texto,n,"SEM REFERENCIA");return;}
+  if(!amostraBateriaAnterior || !leituraAtualOK) {snprintf(texto,n,"SEM MEDICAO");return;}
+  if(correnteAtual>0.05f) {snprintf(texto,n,"CARREGANDO");return;}
+  if(tempoMediaBateria<60000) {snprintf(texto,n,"AGUARDE 1 MIN");return;}
+  if(mediaCorrenteBateria>=-0.05f) {snprintf(texto,n,"SEM ESTIMATIVA");return;}
+  double uteis=bateria.restanteAh-configuracao.capacidadeAh*configuracao.reservaPct/100.0;
+  double minutos=fmax(0.0,uteis)/(-mediaCorrenteBateria)*60;
+  if(minutos>59999) {snprintf(texto,n,">999h EST.");return;}
+  uint32_t m=(uint32_t)minutos;snprintf(texto,n,"%luh%02lu EST.",(unsigned long)(m/60),(unsigned long)(m%60));
+}
 
 uint32_t checksumConfig(const ConfigMonitor &c) {
   const uint8_t *p = reinterpret_cast<const uint8_t *>(&c);
@@ -145,6 +309,8 @@ bool validarConfig(const ConfigMonitor &c) {
     uint16_t b=c.brilhoLED[n];
     if(b!=5 && (b<10 || b>100 || b%10!=0)) return false;
   }
+  if(c.capacidadeAh<1 || c.capacidadeAh>1000 || c.reservaPct>90 ||
+     c.perfilBat>1 || c.eficienciaPct<50 || c.eficienciaPct>100) return false;
   if (c.baixaCV > 1800 || c.criticaCV > 1800 || c.altaCV > 3600 ||
       c.maximaCA > 2000 || c.som > 1 || c.duracaoMs < 50 || c.duracaoMs > 500 ||
       c.frequenciaHz < 500 || c.frequenciaHz > 4000 || c.volume > 50 ||
@@ -158,11 +324,13 @@ bool mesmosValores(const ConfigMonitor &a, const ConfigMonitor &b) {
   return a.baixaCV == b.baixaCV && a.criticaCV == b.criticaCV &&
     a.altaCV == b.altaCV && a.maximaCA == b.maximaCA && a.som == b.som &&
     a.duracaoMs == b.duracaoMs && a.frequenciaHz == b.frequenciaHz && a.volume == b.volume &&
-    a.rotacaoSeg == b.rotacaoSeg;
+    a.rotacaoSeg == b.rotacaoSeg && a.capacidadeAh==b.capacidadeAh &&
+    a.reservaPct==b.reservaPct && a.perfilBat==b.perfilBat && a.eficienciaPct==b.eficienciaPct;
 }
 ConfigMonitor padroesConfig() {
   ConfigMonitor c = {};
   // Limites 0 = desativados, preservando o comportamento do codigo recebido.
+  c.capacidadeAh=30; c.reservaPct=50; c.perfilBat=0; c.eficienciaPct=95;
   c.som = 1; c.duracaoMs = 150; c.frequenciaHz = 3000; c.volume = 20;
   for(uint8_t n=0;n<4;n++) c.brilhoLED[n]=100;
   return c;
@@ -176,7 +344,7 @@ bool lerConfig(int slot, ConfigMonitor &c) {
     f.close();
     if (!ok || antiga.magic != 0x4D4F4E49UL || antiga.versao != 1 ||
         antiga.checksum != checksumV1(antiga)) return false;
-    c = {};
+    c = padroesConfig();
     memcpy(&c, &antiga, offsetof(ConfigMonitorV1, checksum));
     for(uint8_t n=0;n<4;n++) c.brilhoLED[n]=100;
     c.rotacaoSeg = 0; c.checksum = checksumConfig(c);
@@ -187,13 +355,23 @@ bool lerConfig(int slot, ConfigMonitor &c) {
     bool ok=f.read(reinterpret_cast<uint8_t*>(&antiga),sizeof(antiga))==sizeof(antiga);
     f.close();
     if(!ok || antiga.magic!=0x4D4F4E49UL || antiga.versao!=2 || antiga.checksum!=checksumV2(antiga)) return false;
-    c={};memcpy(&c,&antiga,offsetof(ConfigMonitorV2,checksum));
+    c=padroesConfig();memcpy(&c,&antiga,offsetof(ConfigMonitorV2,checksum));
     for(uint8_t n=0;n<4;n++) c.brilhoLED[n]=100;
+    c.checksum=checksumConfig(c);return validarConfig(c);
+  }
+  if(f.size()==sizeof(ConfigMonitorV3)) {
+    ConfigMonitorV3 antiga={};
+    bool ok=f.read(reinterpret_cast<uint8_t*>(&antiga),sizeof(antiga))==sizeof(antiga);
+    f.close();
+    const uint8_t *p=reinterpret_cast<const uint8_t*>(&antiga);uint32_t h=2166136261UL;
+    for(size_t n=0;n<offsetof(ConfigMonitorV3,checksum);n++) h=(h^p[n])*16777619UL;
+    if(!ok || antiga.magic!=0x4D4F4E49UL || antiga.versao!=3 || antiga.checksum!=h) return false;
+    c=padroesConfig();memcpy(&c,&antiga,offsetof(ConfigMonitorV3,checksum));
     c.checksum=checksumConfig(c);return validarConfig(c);
   }
   bool ok = f.size() == sizeof(c) && f.read(reinterpret_cast<uint8_t *>(&c), sizeof(c)) == sizeof(c);
   f.close();
-  return ok && c.magic == 0x4D4F4E49UL && c.versao == 3 &&
+  return ok && c.magic == 0x4D4F4E49UL && c.versao == 4 &&
     validarConfig(c) && c.checksum == checksumConfig(c);
 }
 void carregarConfiguracao() {
@@ -210,10 +388,13 @@ void carregarConfiguracao() {
 }
 bool salvarConfiguracao() {
   if (!fsOK || !validarConfig(edicao)) return false;
-  if (configSalva && configuracao.versao == 3 && mesmosValores(edicao, configuracao)) return true;
+  if (configSalva && configuracao.versao == 4 && mesmosValores(edicao, configuracao)) return true;
   ConfigMonitor nova = edicao;
-  nova.magic = 0x4D4F4E49UL; nova.versao = 3; nova.reservado = 0;
+  nova.magic = 0x4D4F4E49UL; nova.versao = 4; nova.reservado = 0;
   nova.geracao = configuracao.geracao + 1;
+  nova.identidadeBateria=configuracao.identidadeBateria;
+  if(nova.capacidadeAh!=configuracao.capacidadeAh || nova.perfilBat!=configuracao.perfilBat)
+    nova.identidadeBateria=configuracao.identidadeBateria+1;
   nova.checksum = checksumConfig(nova);
   int destino = slotConfig == 0 ? 1 : 0;
   File f = LittleFS.open(CONFIG_FILES[destino], "w");
@@ -223,7 +404,9 @@ bool salvarConfiguracao() {
   ConfigMonitor conferida = {};
   if (escritos != sizeof(nova) || !lerConfig(destino, conferida) ||
       memcmp(&nova, &conferida, sizeof(nova)) != 0) return false;
+  bool mudouBateria=conferida.capacidadeAh!=configuracao.capacidadeAh || conferida.perfilBat!=configuracao.perfilBat;
   configuracao = conferida; edicao = configuracao; slotConfig = destino; configSalva = true;
+  if(mudouBateria) configuracaoBateriaMudou();
   Serial.printf("Ajustes salvos: baixa=%.2f critica=%.2f alta=%.2f maxima=%.2f som=%u beep=%u ms\n",
     configuracao.baixaCV / 100.0, configuracao.criticaCV / 100.0,
     configuracao.altaCV / 100.0, configuracao.maximaCA / 100.0,
@@ -264,6 +447,10 @@ int proximoItem(int item, int sentido) {
   return item;
 }
 String valorMenu() {
+  if(itemMenu==13) return String(edicao.capacidadeAh)+" Ah";
+  if(itemMenu==14) return edicao.perfilBat==0?"CHUMBO 12V":"GENERICO";
+  if(itemMenu==15) return String(edicao.reservaPct)+"%";
+  if(itemMenu==16) return String(edicao.eficienciaPct)+"%";
   if (itemMenu == 12) return edicao.rotacaoSeg ? String(edicao.rotacaoSeg) + " s" : "DESATIVADO";
   uint16_t valor = itemMenu == 0 ? edicao.baixaCV : itemMenu == 1 ? edicao.criticaCV :
     itemMenu == 2 ? edicao.altaCV : edicao.maximaCA;
@@ -277,6 +464,11 @@ String valorMenu() {
   return String(edicao.volume) + "%";
 }
 void ajustarItem(int sentido) {
+  if(itemMenu==13) {edicao.capacidadeAh=constrain((int)edicao.capacidadeAh+sentido,1,1000);return;}
+  if(itemMenu==14) {edicao.perfilBat=1-edicao.perfilBat;edicao.eficienciaPct=edicao.perfilBat==0?95:100;return;}
+  if(itemMenu==15) {edicao.reservaPct=constrain((int)edicao.reservaPct+sentido*5,0,90);return;}
+  if(itemMenu==16) {edicao.eficienciaPct=constrain((int)edicao.eficienciaPct+sentido,50,100);return;}
+
   if (itemMenu == 12) {
     int indice = edicao.rotacaoSeg / 5;
     edicao.rotacaoSeg = ((indice + sentido + 7) % 7) * 5;
@@ -306,7 +498,11 @@ void botaoPressionado(uint8_t n) {
     else navegarTela(n == 0 ? -1 : 1);
   } else if (pagina == LISTA_MENU) {
     if (n != 1) itemMenu = proximoItem(itemMenu, n == 0 ? -1 : 1);
-    else if (itemMenu < 8 || itemMenu >= 12) pagina = EDITAR_MENU;
+    else if(itemMenu==17) {
+      if(!mesmosValores(configuracao,edicao)) avisarMenu("Salve os ajustes antes");
+      else pagina=SINCRONIZAR_MENU;
+    }
+    else if (itemMenu < 8 || (itemMenu >= 12 && itemMenu<=16)) pagina = EDITAR_MENU;
     else if (itemMenu == 8) {
       if (!validarConfig(edicao)) avisarMenu("Limites inconsistentes");
       else if (!salvarConfiguracao()) avisarMenu("Falha salvar LittleFS");
@@ -316,6 +512,12 @@ void botaoPressionado(uint8_t n) {
     else pagina = RECONHECER_MENU;
   } else if (pagina == EDITAR_MENU) {
     if (n == 1) pagina = LISTA_MENU; else ajustarItem(n == 0 ? -1 : 1);
+  } else if(pagina==SINCRONIZAR_MENU) {
+    if(n==1) {
+      if(sincronizarBateria()) avisarMenu("Bateria em 100% salva");
+      else avisarMenu("Falha: leitura ou FS");
+    }
+    pagina=LISTA_MENU;
   } else if (pagina == RECONHECER_MENU) {
     if (n == 1) {
       if (reconhecerAlertas()) avisarMenu("Historico reconhecido");
@@ -386,6 +588,11 @@ void desenharMenu() {
     String valor = valorMenu(); tela.setTextSize(valor.length() > 10 ? 1 : 2);
     tela.setCursor(0, 29); tela.print(valor); tela.setTextSize(1);
     tela.setCursor(0, 47); tela.print("Anterior - Proximo +");
+  } else if(pagina==SINCRONIZAR_MENU) {
+    tela.println("Confirmar carga cheia?");
+    tela.println("So apos carga completa");
+    tela.println("Confirmar: sim");
+    tela.println("Anterior/Proximo: nao");
   } else if (pagina == RECONHECER_MENU) {
     tela.println("Reconhecer historico?");
     tela.println("Confirmar: sim");
@@ -841,7 +1048,7 @@ bool criarArquivo() {
   File arquivo = SD.open(novo, FILE_WRITE);
   if (!arquivo) return false;
   const char cabecalho[] =
-      "data_hora_local,tempo_ms,tensao_V,shunt_mV,corrente_A,potencia_W\n";
+      "data_hora_local,tempo_ms,tensao_V,shunt_mV,corrente_A,potencia_W,soc_pct,restante_Ah,retirados_Ah,recebidos_Ah,soc_valido,soc_retomado\n";
   size_t escritos = arquivo.write((const uint8_t *)cabecalho,
                                   sizeof(cabecalho) - 1);
   arquivo.close();
@@ -858,10 +1065,13 @@ bool criarArquivo() {
 
 bool gravarMedicao(const char *data, uint32_t tempo, float volts,
                   float milivolts, float corrente, float potencia) {
-  char linha[160];
+  char linha[256],soc[16]="",restante[20]="";
+  float pct=percentualBateria();
+  if(pct>=0) {snprintf(soc,sizeof(soc),"%.2f",pct);snprintf(restante,sizeof(restante),"%.5f",bateria.restanteAh);}
   int tamanho = snprintf(linha, sizeof(linha),
-      "%s,%lu,%.3f,%.3f,%.6f,%.6f\n", data, (unsigned long)tempo,
-      volts, milivolts, corrente, potencia);
+      "%s,%lu,%.3f,%.3f,%.6f,%.6f,%s,%s,%.5f,%.5f,%u,%u\n", data, (unsigned long)tempo,
+      volts, milivolts, corrente, potencia,soc,restante,bateria.retiradosAh,bateria.recebidosAh,
+      bateria.sincronizada?1:0,bateriaRetomada?1:0);
   if (tamanho <= 0 || tamanho >= (int)sizeof(linha)) return false;
   // A medicao 10001 inicia o proximo CSV. Sem dependencia de hora ou Wi-Fi.
   if (linhasArquivo >= MAX_LINHAS_ARQUIVO) {
@@ -885,7 +1095,7 @@ void entrarMenuTela() {
 void navegarTela(int sentido) {
   Vista anterior = vista;
   if (anterior != VISTA_ALERTA) vistaRetorno = anterior;
-  vista = static_cast<Vista>((static_cast<int>(vista) + sentido + 5) % 5);
+  vista = static_cast<Vista>((static_cast<int>(vista) + sentido + 6) % 6);
   alertaTelaPendente = false;
   alertaForcado = vista == VISTA_ALERTA && alarmeAtual != SEM_ALARME;
   cicloAlertaEm = vistaEm = millis(); telaPendente = true;
@@ -920,7 +1130,7 @@ void atualizarNavegacao() {
   if (!alertaForcado && configuracao.rotacaoSeg &&
       agora - vistaEm >= (uint32_t)configuracao.rotacaoSeg * 1000UL) {
     vista = vista == VISTA_ALERTA ? VISTA_RESUMO :
-      static_cast<Vista>((static_cast<int>(vista) + 1) % 4);
+      static_cast<Vista>((static_cast<int>(vista) + 1) % 5);
     vistaEm = agora; telaPendente = true;
   }
 }
@@ -956,11 +1166,10 @@ void cabecalhoTela(bool alerta) {
   desenharWiFi(); tela.drawFastHLine(4, 12, 120, SSD1306_WHITE);
 }
 int nivelBateria(float v, bool valida) {
-  if (!valida || !isfinite(v) || v < 2.0f) return -1;
-  if (v >= BAT_CHEIA_V) return 4;
-  if (v >= BAT_MEDIA_V) return 2;
-  if (v >= BAT_FIM_V) return 1;
-  return 0;
+  float pct=percentualBateria();
+  if(!valida || v<2 || pct<0) return -1;
+  if(pct<=0) return 0;
+  return pct>75?4:pct>50?3:pct>25?2:1;
 }
 void desenharBateria(int nivel) {
   tela.drawRoundRect(8, 24, 24, 33, 4, SSD1306_WHITE);
@@ -1024,9 +1233,32 @@ void desenharTelaAlerta() {
   tela.print(alarmeAtual == SEM_ALARME ? "Confirmar: menu" : "Proximo: sair");
   enviarTela();
 }
+void desenharTelaBateria() {
+  cabecalhoTela(false);
+  float pct=percentualBateria();
+  desenharBateria(nivelBateria(tensaoAtual,leituraAtualOK));
+  tela.setCursor(40,16);tela.print("BATERIA ");tela.print(configuracao.capacidadeAh);tela.print("Ah");
+  tela.setCursor(40,27);tela.setTextSize(2);
+  if(pct<0) tela.print("--%");else {tela.print(pct,0);tela.print('%');}
+  tela.setTextSize(1);tela.setCursor(40,45);
+  if(pct<0) {tela.print("Saiu:");tela.print(bateria.retiradosAh,2);tela.print("Ah");}
+  else {tela.print(bateria.restanteAh,1);tela.print("Ah ");tela.print(bateriaRetomada?"~":"EST.");}
+  char autonomia[24];textoAutonomia(autonomia,sizeof(autonomia));
+  tela.setCursor(4,56);
+  if(!bateriaPersistenciaOK) tela.print("BAT: ERRO AO SALVAR");
+  else if(pct<0) tela.print("Menu: Bateria cheia");
+  else {
+    if((autonomia[0]>='0' && autonomia[0]<='9') || autonomia[0]=='>') {
+      tela.print("Ate ");tela.print(configuracao.reservaPct);tela.print("% ");
+    }
+    tela.print(autonomia);
+  }
+  enviarTela();
+}
 void desenharTelaOperacao() {
   if (!oledOK) return;
   if (vista == VISTA_ALERTA) { desenharTelaAlerta(); return; }
+  if (vista == VISTA_BATERIA) { desenharTelaBateria(); return; }
   cabecalhoTela(false);
   if (vista == VISTA_RESUMO) {
     desenharMedicao('V', tensaoAtual, 16, leituraAtualOK);
@@ -1038,8 +1270,9 @@ void desenharTelaOperacao() {
       tela.print("TENSAO"); int n=nivelBateria(tensaoAtual, leituraAtualOK);
       desenharBateria(n); valorGrandeDireita(tensaoAtual, leituraAtualOK);
       tela.setCursor(44, 49);tela.print("V ");
-      tela.print(n<0?"SEM BAT.":n==4?"CHEIA*":n==2?"MEDIA*":n==1?"P.FIM*":"VAZIA*");
-      tela.setCursor(44, 57);tela.print("*EST. TENSAO");
+      float pct=percentualBateria();
+      if(pct<0) tela.print("SOC: --");else {tela.print(pct,0);tela.print("% EST.");}
+      tela.setCursor(44, 57);tela.print(pct<0?"SINCRONIZAR":"EST. POR Ah");
     } else if (vista == VISTA_CORRENTE) {
       tela.print("CORRENTE"); desenharTomada(leituraAtualOK && fabsf(correnteAtual)>0.05f);
       valorGrandeDireita(correnteAtual, leituraAtualOK);
@@ -1097,11 +1330,12 @@ void setup() {
   pinMode(BUZZER, OUTPUT);
   Serial.begin(115200);
   delay(500);
-  Serial.println("\n=== MONITOR: CORRECAO WATCHDOG ===");
+  Serial.println("\n=== MONITOR: BATERIA / Ah ===");
   Serial.print("Motivo do reset: ");Serial.println(ESP.getResetReason());
   Serial.println(ESP.getResetInfo());
   Wire.begin(D2, D1);
   carregarConfiguracao();
+  carregarBateria();
   Wire.setClock(100000);
   oledOK = tela.begin(SSD1306_SWITCHCAPVCC, 0x3C);
   if (!oledOK) Serial.println("Falha ao inicializar OLED.");
@@ -1134,7 +1368,7 @@ void setup() {
 void atualizarLEDs() {
   if (!mcpOK || falhaMCP) return;
   uint8_t leds = 0;
-  if (alarmeAtual != SEM_ALARME || !fsOK) leds |= 0x01;
+  if (alarmeAtual != SEM_ALARME || !fsOK || !bateriaPersistenciaOK) leds |= 0x01;
   if (historicoAlertas || !mesmosValores(configuracao, edicao)) leds |= 0x02;
   if (leituraAtualOK && alarmeAtual == SEM_ALARME) leds |= 0x04;
   if (WiFi.status() == WL_CONNECTED) leds |= 0x08;
@@ -1197,6 +1431,7 @@ void loop() {
       float voltsShunt = (int16_t)brutoShunt * 0.0000025f;
       correnteAtual = voltsShunt / RESISTENCIA_SHUNT;
       potenciaAtual = tensaoAtual * correnteAtual;
+      atualizarContagem(true,tensaoAtual,correnteAtual,agora);
       if (sdOK && !gravarMedicao(data, agora, tensaoAtual, voltsShunt * 1000.0f,
                                 correnteAtual, potenciaAtual)) {
         sdOK = false; Serial.println("Falha SD: gravacao interrompida. Verifique o cartao.");
@@ -1206,9 +1441,14 @@ void loop() {
         sdOK && logAlertasOK ? "OK" : "ERRO", WiFi.status() == WL_CONNECTED ? "OK" : "DESCONECTADO",
         fsOK ? "OK" : "ERRO");
     }
+    if(!leituraAtualOK) atualizarContagem(false,0,0,agora);
+    char autonomia[24];textoAutonomia(autonomia,sizeof(autonomia));
+    if(percentualBateria()<0) Serial.printf("Bateria: SOC desconhecido | Retirados: %.4f Ah | Recebidos: %.4f Ah\n",bateria.retiradosAh,bateria.recebidosAh);
+    else Serial.printf("Bateria: %.1f%% EST%s | Restante: %.3f Ah | Autonomia: %s | BAT_FS: %s\n",percentualBateria(),bateriaRetomada?" RETOMADA":"",bateria.restanteAh,autonomia,bateriaPersistenciaOK?"OK":"ERRO");
     avaliarAlarme(leituraAtualOK, tensaoAtual, correnteAtual);
     telaPendente = true;
   }
+  manterBateria();
   atualizarNavegacao();
   if (telaPendente || agora - ultimaTela >= 200) {
     apresentarTela(); ultimaTela = agora;
