@@ -23,8 +23,8 @@
 // Configuracoes na LittleFS; CSVs e eventos no SD. Nunca formata automaticamente.
 // Limites de alarme sao avisos: este codigo NAO corta a alimentacao da carga.
 // Altere as credenciais abaixo. Limites podem ser ajustados no menu.
-const char *SSID = "WIFI_NAME";
-const char *SENHA = "SENHA";
+const char *SSID = "Cronin 2G";
+const char *SENHA = "redcard789";
 const uint8_t CS_SD = D4;
 const uint8_t BUZZER = D0;
 const uint8_t INA226 = 0x40;
